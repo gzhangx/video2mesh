@@ -8,6 +8,16 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from video2mesh.colmap_io import Reconstruction, list_model_dirs, read_model
+from video2mesh.colmap_options import (
+    FEATURE_MAX_IMAGE_SIZE,
+    FEATURE_MAX_NUM_FEATURES,
+    FEATURE_USE_GPU,
+    MATCH_USE_GPU,
+    ColmapCli,
+    apply_pycolmap_extraction,
+    apply_pycolmap_matching,
+    option,
+)
 from video2mesh.config import SFM_TIPS
 from video2mesh.deps import command_argv, require_colmap, run_command
 from video2mesh.errors import MissingDependencyError, ReconstructionError
@@ -111,25 +121,19 @@ def undistort_images(
     dense_dir.mkdir(parents=True, exist_ok=True)
     if backend == "cli":
         exe = require_colmap(colmap_exe)
-        run_command(
-            command_argv(
-                exe,
-                [
-                    "image_undistorter",
-                    "--image_path",
-                    str(image_dir),
-                    "--input_path",
-                    str(model_dir),
-                    "--output_path",
-                    str(dense_dir),
-                    "--output_type",
-                    "COLMAP",
-                    "--max_image_size",
-                    str(max_image_size),
-                ],
-            ),
-            echo="info",
+        argv = ["image_undistorter"]
+        ColmapCli(exe).add(
+            argv,
+            "image_undistorter",
+            [
+                option("image_path", "image_path", image_dir),
+                option("input_path", "input_path", model_dir),
+                option("output_path", "output_path", dense_dir),
+                option("output_type", "output_type", "COLMAP"),
+                option("max_image_size", ("max_image_size", "Undistortion.max_image_size"), max_image_size),
+            ],
         )
+        run_command(command_argv(exe, argv), echo="info")
     else:
         try:
             import pycolmap
@@ -182,81 +186,58 @@ def _run_cli(
     use_gpu: bool,
 ) -> None:
     gpu_flag = "1" if use_gpu else "0"
+    cli = ColmapCli(exe)
     logger.info("COLMAP feature_extractor (gpu=%s, model=%s)", gpu_flag, camera_model)
-    run_command(
-        command_argv(
-            exe,
-            [
-                "feature_extractor",
-                "--database_path",
-                str(database),
-                "--image_path",
-                str(image_dir),
-                "--ImageReader.single_camera",
-                "1",
-                "--ImageReader.camera_model",
-                camera_model,
-                "--SiftExtraction.max_image_size",
-                str(preset["sift_max_image_size"]),
-                "--SiftExtraction.max_num_features",
-                str(preset["max_num_features"]),
-                "--SiftExtraction.use_gpu",
-                gpu_flag,
-            ],
-        ),
-        echo="info",
+    extract_argv = ["feature_extractor"]
+    cli.add(
+        extract_argv,
+        "feature_extractor",
+        [
+            option("database_path", "database_path", database),
+            option("image_path", "image_path", image_dir),
+            option("single_camera", "ImageReader.single_camera", "1"),
+            option("camera_model", "ImageReader.camera_model", camera_model),
+            option("feature_max_image_size", FEATURE_MAX_IMAGE_SIZE, preset["sift_max_image_size"]),
+            option("feature_max_num_features", FEATURE_MAX_NUM_FEATURES, preset["max_num_features"]),
+            option("feature_use_gpu", FEATURE_USE_GPU, gpu_flag),
+        ],
     )
+    run_command(command_argv(exe, extract_argv), echo="info")
     logger.info(
         "COLMAP sequential_matcher (overlap=%s)",
         preset["sequential_overlap"],
     )
-    run_command(
-        command_argv(
-            exe,
-            [
-                "sequential_matcher",
-                "--database_path",
-                str(database),
-                "--SequentialMatching.overlap",
-                str(preset["sequential_overlap"]),
-                "--SequentialMatching.quadratic_overlap",
-                "1",
-                "--SiftMatching.use_gpu",
-                gpu_flag,
-            ],
-        ),
-        echo="info",
+    match_argv = ["sequential_matcher"]
+    cli.add(
+        match_argv,
+        "sequential_matcher",
+        [
+            option("database_path", "database_path", database),
+            option("sequential_overlap", "SequentialMatching.overlap", preset["sequential_overlap"]),
+            option("quadratic_overlap", "SequentialMatching.quadratic_overlap", "1"),
+            option("matching_use_gpu", MATCH_USE_GPU, gpu_flag),
+        ],
     )
+    run_command(command_argv(exe, match_argv), echo="info")
     logger.info("COLMAP mapper")
-    run_command(
-        command_argv(
-            exe,
-            [
-                "mapper",
-                "--database_path",
-                str(database),
-                "--image_path",
-                str(image_dir),
-                "--output_path",
-                str(sparse_root),
-                "--Mapper.min_model_size",
-                "3",
-                "--Mapper.multiple_models",
-                "1",
-                "--Mapper.init_min_num_inliers",
-                str(preset["init_min_num_inliers"]),
-                "--Mapper.init_min_tri_angle",
-                str(preset["init_min_tri_angle"]),
-                "--Mapper.init_max_forward_motion",
-                "0.98",
-                "--Mapper.abs_pose_min_num_inliers",
-                "15",
-                "--Mapper.ba_refine_principal_point",
-                "0",
-            ],
-        ),
-        echo="info",
+    map_argv = ["mapper"]
+    cli.add(
+        map_argv,
+        "mapper",
+        [
+            option("database_path", "database_path", database),
+            option("image_path", "image_path", image_dir),
+            option("output_path", "output_path", sparse_root),
+            option("min_model_size", "Mapper.min_model_size", "3"),
+            option("multiple_models", "Mapper.multiple_models", "1"),
+            option("init_min_num_inliers", "Mapper.init_min_num_inliers", preset["init_min_num_inliers"]),
+            option("init_min_tri_angle", "Mapper.init_min_tri_angle", preset["init_min_tri_angle"]),
+            option("init_max_forward_motion", "Mapper.init_max_forward_motion", "0.98"),
+            option("abs_pose_min_num_inliers", "Mapper.abs_pose_min_num_inliers", "15"),
+            option("ba_refine_principal_point", "Mapper.ba_refine_principal_point", "0"),
+        ],
     )
+    run_command(command_argv(exe, map_argv), echo="info")
 
 
 def _run_pycolmap(
@@ -356,21 +337,17 @@ def _ensure_text_model(model_dir: Path, colmap_exe: str | None) -> None:
     if (model_dir / "cameras.txt").is_file() and (model_dir / "images.txt").is_file():
         return
     if colmap_exe:
-        run_command(
-            command_argv(
-                colmap_exe,
-                [
-                    "model_converter",
-                    "--input_path",
-                    str(model_dir),
-                    "--output_path",
-                    str(model_dir),
-                    "--output_type",
-                    "TXT",
-                ],
-            ),
-            echo="info",
+        convert_argv = ["model_converter"]
+        ColmapCli(colmap_exe).add(
+            convert_argv,
+            "model_converter",
+            [
+                option("input_path", "input_path", model_dir),
+                option("output_path", "output_path", model_dir),
+                option("output_type", "output_type", "TXT"),
+            ],
         )
+        run_command(command_argv(colmap_exe, convert_argv), echo="info")
         return
     try:
         import pycolmap
@@ -427,24 +404,12 @@ def _extraction_options(pycolmap, preset: dict, use_gpu: bool):
     if not hasattr(pycolmap, "FeatureExtractionOptions"):
         return None
     options = pycolmap.FeatureExtractionOptions()
-    _assign(
+    apply_pycolmap_extraction(
         options,
-        {
-            "max_num_features": int(preset["max_num_features"]),
-            "max_image_size": int(preset["sift_max_image_size"]),
-            "use_gpu": use_gpu,
-        },
+        max_image_size=int(preset["sift_max_image_size"]),
+        max_num_features=int(preset["max_num_features"]),
+        use_gpu=use_gpu,
     )
-    sift = getattr(options, "sift", None)
-    if sift is not None:
-        _assign(
-            sift,
-            {
-                "max_num_features": int(preset["max_num_features"]),
-                "max_image_size": int(preset["sift_max_image_size"]),
-                "use_gpu": use_gpu,
-            },
-        )
     return options
 
 
@@ -452,10 +417,7 @@ def _matching_options(pycolmap, use_gpu: bool):
     if not hasattr(pycolmap, "FeatureMatchingOptions"):
         return None
     options = pycolmap.FeatureMatchingOptions()
-    _assign(options, {"use_gpu": use_gpu})
-    sift = getattr(options, "sift", None)
-    if sift is not None:
-        _assign(sift, {"use_gpu": use_gpu})
+    apply_pycolmap_matching(options, use_gpu=use_gpu)
     return options
 
 

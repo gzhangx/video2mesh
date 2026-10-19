@@ -74,6 +74,8 @@ $env:Path = "C:\tools\COLMAP;" + $env:Path
 
 `colmap.bat` wrappers are supported. You can also pass `--colmap-exe` on the command line.
 
+COLMAP 3.x and 4.x are both supported. Version 4 moved `max_image_size` and `use_gpu` from `SiftExtraction` / `SiftMatching` to `FeatureExtraction` / `FeatureMatching`. video2mesh reads each subcommand's `-h` output and passes the flag that binary still has, so a 4.2 CUDA build and an older no-CUDA build use the same command.
+
 Optional: `pip install pycolmap` and `--backend pycolmap` if you cannot install the executable. The executable is the path this project is tested with, and it is the straightforward install on Windows.
 
 ### 4. Run it

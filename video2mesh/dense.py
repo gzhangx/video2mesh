@@ -10,6 +10,7 @@ import numpy as np
 import open3d as o3d
 
 from video2mesh.colmap_io import Camera, FramePose, Reconstruction, camera_matrix, read_model
+from video2mesh.colmap_options import STEREO_INPUT_TYPE, ColmapCli, option
 from video2mesh.deps import command_argv, require_colmap, run_command
 from video2mesh.errors import ReconstructionError
 
@@ -343,40 +344,33 @@ def _try_patch_match(workspace: Path, colmap_exe: str | None) -> o3d.geometry.Po
     exe = require_colmap(colmap_exe)
     fused_path = dense_dir / "fused.ply"
     try:
+        cli = ColmapCli(exe)
         logger.info("COLMAP patch_match_stereo")
-        run_command(
-            command_argv(
-                exe,
-                [
-                    "patch_match_stereo",
-                    "--workspace_path",
-                    str(dense_dir),
-                    "--workspace_format",
-                    "COLMAP",
-                    "--PatchMatchStereo.geom_consistency",
-                    "true",
-                ],
-            ),
-            echo="info",
+        patch_argv = ["patch_match_stereo"]
+        cli.add(
+            patch_argv,
+            "patch_match_stereo",
+            [
+                option("workspace_path", "workspace_path", dense_dir),
+                option("workspace_format", "workspace_format", "COLMAP"),
+                # Numeric 1, not the word "true": some COLMAP builds parse "true" as 0.
+                option("geom_consistency", "PatchMatchStereo.geom_consistency", "1"),
+            ],
         )
+        run_command(command_argv(exe, patch_argv), echo="info")
         logger.info("COLMAP stereo_fusion")
-        run_command(
-            command_argv(
-                exe,
-                [
-                    "stereo_fusion",
-                    "--workspace_path",
-                    str(dense_dir),
-                    "--workspace_format",
-                    "COLMAP",
-                    "--input_type",
-                    "geometric",
-                    "--output_path",
-                    str(fused_path),
-                ],
-            ),
-            echo="info",
+        fuse_argv = ["stereo_fusion"]
+        cli.add(
+            fuse_argv,
+            "stereo_fusion",
+            [
+                option("workspace_path", "workspace_path", dense_dir),
+                option("workspace_format", "workspace_format", "COLMAP"),
+                option("input_type", STEREO_INPUT_TYPE, "geometric"),
+                option("output_path", "output_path", fused_path),
+            ],
         )
+        run_command(command_argv(exe, fuse_argv), echo="info")
     except ReconstructionError as exc:
         logger.warning("Patch-match stereo failed:\n%s", exc)
         return None

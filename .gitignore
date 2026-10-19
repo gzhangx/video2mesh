@@ -8,3 +8,5 @@ build/
 sample_data/
 output/
 .DS_Store
+out
+*.mp4

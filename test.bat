@@ -1,0 +1,1 @@
+rem ffmpeg -i "D:\temp\IMG_0757.MOV" -c:v libx264 -crf 18 -preset slow -c:a aac "D:\temp\yourvideo.mp4"
