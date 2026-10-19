@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "video2mesh"
+version = "0.1.0"
+description = "Turn a video into a 3D mesh and per-frame camera poses with COLMAP and Open3D."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    "opencv-python-headless>=4.9",
+    "open3d>=0.18",
+]
+
+[project.optional-dependencies]
+pycolmap = ["pycolmap>=0.6"]
+dev = ["pytest>=8"]
+
+[project.scripts]
+video2mesh = "video2mesh.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["video2mesh*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
