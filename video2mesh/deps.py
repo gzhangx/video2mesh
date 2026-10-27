@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import logging
 import os
+import queue
 import shutil
 import subprocess
+import threading
+import time
 from collections import deque
 from pathlib import Path
 
@@ -178,13 +181,24 @@ def run_command(
     *,
     cwd: Path | None = None,
     echo: str = "debug",
+    label: str | None = None,
+    heartbeat_seconds: float = 20.0,
+    on_line: callable | None = None,
 ) -> str:
     """Run a command, capture its combined log, and raise on a non-zero exit.
 
-    ``echo`` is ``debug`` (default), ``info``, or ``silent``. Output is always
-    returned so a failure can include the tail of the log.
+    ``echo`` is ``debug`` (every line at DEBUG), ``info`` (every line at INFO),
+    ``progress`` (DEBUG for every line, INFO for recognized progress lines),
+    or ``silent``. A heartbeat is logged when a ``progress`` command stays
+    quiet, so a long COLMAP step does not look frozen. The full transcript is
+    still returned and, at DEBUG, written to log.txt.
     """
-    logger.debug("Running: %s", " ".join(argv))
+    if echo not in {"debug", "info", "progress", "silent"}:
+        raise ValueError(f"Unknown echo mode {echo!r}")
+    shown = " ".join(argv)
+    logger.debug("Running: %s", shown)
+    if echo == "progress":
+        logger.info("running %s", label or argv[0])
     try:
         proc = subprocess.Popen(
             argv,
@@ -199,20 +213,74 @@ def run_command(
             f"Could not start {argv[0]!r}. Is it installed and on PATH?"
         ) from exc
     assert proc.stdout is not None
+    lines: queue.Queue[str | None] = queue.Queue()
+
+    def _read() -> None:
+        try:
+            assert proc.stdout is not None
+            for raw in proc.stdout:
+                lines.put(raw)
+        finally:
+            lines.put(None)
+
+    threading.Thread(target=_read, daemon=True).start()
     tail: deque[str] = deque(maxlen=40)
     chunks: list[str] = []
-    log_fn = {"debug": logger.debug, "info": logger.info, "silent": None}[echo]
-    for line in proc.stdout:
-        line = line.rstrip()
+    started = time.monotonic()
+    last_note = started
+    pulse = heartbeat_seconds if echo == "progress" and heartbeat_seconds > 0 else 0.0
+    while True:
+        timeout = pulse if pulse else None
+        try:
+            raw = lines.get(timeout=timeout)
+        except queue.Empty:
+            now = time.monotonic()
+            if now - last_note >= pulse:
+                logger.info(
+                    "still working on %s (%s elapsed, no new output)",
+                    label or argv[0],
+                    _elapsed(now - started),
+                )
+                last_note = now
+            continue
+        if raw is None:
+            break
+        line = raw.rstrip()
         chunks.append(line)
         tail.append(line)
-        if log_fn is not None and line:
-            log_fn(line)
+        _log_subprocess_line(line, echo)
+        if on_line is not None and line:
+            on_line(line)
+        last_note = time.monotonic()
     code = proc.wait()
     output = "\n".join(chunks)
     if code != 0:
         preview = "\n".join(tail) if tail else "(no output)"
         raise ReconstructionError(
-            f"Command failed with exit code {code}: {argv[0]}\n{preview}"
+            f"Command failed with exit code {code}: {shown}\n{preview}"
         )
     return output
+
+
+def _log_subprocess_line(line: str, echo: str) -> None:
+    if not line or echo == "silent":
+        return
+    if echo == "info":
+        logger.info("%s", line)
+        return
+    if echo == "debug":
+        logger.debug("%s", line)
+        return
+    # progress: keep the full line in the debug log, and surface useful ones.
+    logger.debug("%s", line)
+    from video2mesh.progress import colmap_progress_line
+
+    message = colmap_progress_line(line)
+    if message:
+        logger.info("%s", message)
+
+
+def _elapsed(seconds: float) -> str:
+    from video2mesh.progress import format_duration
+
+    return format_duration(seconds)

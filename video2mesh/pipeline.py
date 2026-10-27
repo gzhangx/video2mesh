@@ -14,11 +14,12 @@ from video2mesh import __version__
 from video2mesh.config import ReconstructConfig
 from video2mesh.dense import build_point_cloud
 from video2mesh.deps import colmap_version_text, decide_gpu, require_colmap
-from video2mesh.errors import ReconstructionError
+from video2mesh.errors import ReconstructionError, Video2MeshError
 from video2mesh.export import write_cameras, write_mesh, write_point_cloud
-from video2mesh.frames import extract_frames
+from video2mesh.frames import FrameExtraction, extract_frames
 from video2mesh.mesh import orient_and_mesh
-from video2mesh.sfm import run_sfm, undistort_images
+from video2mesh.progress import RunProgress
+from video2mesh.sfm import SfmOutput, run_sfm, undistort_images
 
 logger = logging.getLogger("video2mesh")
 
@@ -43,6 +44,22 @@ class ReconstructResult:
 def reconstruct(config: ReconstructConfig) -> ReconstructResult:
     output = _prepare_output(config.output, config.overwrite)
     _setup_logging(output / "log.txt", config.log_level)
+    progress = RunProgress()
+    try:
+        return _reconstruct(config, output, progress)
+    except Video2MeshError as exc:
+        message = progress.failure_message(exc)
+        logger.error("%s", message)
+        raised = type(exc)(message)
+        raised.logged = True  # type: ignore[attr-defined]
+        raise raised from exc
+
+
+def _reconstruct(
+    config: ReconstructConfig,
+    output: Path,
+    progress: RunProgress,
+) -> ReconstructResult:
     logger.info("video2mesh %s", __version__)
     logger.info("Video: %s", config.video)
     logger.info("Output: %s", output)
@@ -74,6 +91,7 @@ def reconstruct(config: ReconstructConfig) -> ReconstructResult:
         encoding="utf-8",
     )
 
+    progress.start("frame extraction")
     extraction = extract_frames(
         config.video,
         output / "frames",
@@ -84,6 +102,7 @@ def reconstruct(config: ReconstructConfig) -> ReconstructResult:
         ffmpeg_exe=config.ffmpeg_exe,
     )
     extraction.write_manifest(output / "frames_manifest.json")
+    progress.finish(f"{len(extraction.frames)} frames")
 
     sfm = run_sfm(
         image_dir=extraction.frames_dir,
@@ -93,10 +112,12 @@ def reconstruct(config: ReconstructConfig) -> ReconstructResult:
         use_gpu=use_gpu,
         backend=backend,
         colmap_exe=config.colmap_exe,
+        progress=progress,
     )
 
     undistorted = None
     if config.dense:
+        progress.start("undistort")
         try:
             undistorted = undistort_images(
                 image_dir=extraction.frames_dir,
@@ -107,8 +128,21 @@ def reconstruct(config: ReconstructConfig) -> ReconstructResult:
                 backend=sfm.backend,
             )
         except ReconstructionError as exc:
-            logger.warning("Undistortion failed (%s). Dense stereo will use the original frames.", exc)
+            logger.warning(
+                "Undistortion failed (%s). Dense stereo will use the original frames.",
+                exc,
+            )
+            progress.finish("continued without undistortion")
+        else:
+            detail = "undistorted images" if undistorted is not None else "no undistorted model"
+            progress.finish(detail)
+    else:
+        progress.skip(
+            "undistort",
+            "Dense reconstruction is off, so undistortion is skipped.",
+        )
 
+    progress.start("dense")
     cloud, dense_method = build_point_cloud(
         sparse=sfm.reconstruction,
         image_dir=extraction.frames_dir,
@@ -120,20 +154,11 @@ def reconstruct(config: ReconstructConfig) -> ReconstructResult:
         undistorted_model=undistorted,
         backend=sfm.backend,
     )
+    progress.finish(f"{len(cloud.points)} points via {dense_method}")
+
     pointcloud_path = output / "pointcloud.ply"
-    write_point_cloud(pointcloud_path, cloud)
-
-    records = write_cameras(
-        output / "cameras.json",
-        output / "cameras.csv",
-        source_video=config.video,
-        reconstruction=sfm.reconstruction,
-        extracted=extraction.frames,
-        sparse_dir=sfm.model_dir,
-        dense_method=dense_method,
-    )
-
     centers = np.array([pose.center for pose in sfm.reconstruction.ordered_frames()])
+    progress.start("mesh")
     try:
         meshes = orient_and_mesh(
             cloud,
@@ -143,17 +168,26 @@ def reconstruct(config: ReconstructConfig) -> ReconstructResult:
             poisson_trim=config.poisson_trim,
         )
     except ReconstructionError as exc:
-        raise ReconstructionError(
-            f"{exc}\nCamera poses were still written to {output / 'cameras.json'} "
-            f"and the point cloud to {pointcloud_path}."
-        ) from exc
-
+        try:
+            _write_poses(config, output, pointcloud_path, cloud, sfm, extraction, dense_method)
+            note = (
+                f"\nCamera poses were still written to {output / 'cameras.json'} "
+                f"and the point cloud to {pointcloud_path}."
+            )
+        except Exception as write_exc:
+            note = f"\nCamera poses could not be saved either: {write_exc}"
+        raise ReconstructionError(f"{exc}{note}") from exc
     mesh = meshes["mesh"]
+    progress.finish(f"{len(mesh.vertices)} vertices, {len(mesh.triangles)} triangles")
+
+    progress.start("export")
+    records = _write_poses(config, output, pointcloud_path, cloud, sfm, extraction, dense_method)
     mesh_ply = output / "mesh.ply"
     mesh_obj = output / "mesh.obj"
     write_mesh(mesh_ply, mesh_obj, mesh)
     if "bpa" in meshes:
         write_mesh(output / "mesh_bpa.ply", output / "mesh_bpa.obj", meshes["bpa"])
+    progress.finish("mesh.ply, cameras.json")
 
     result = ReconstructResult(
         output_dir=output,
@@ -171,17 +205,40 @@ def reconstruct(config: ReconstructConfig) -> ReconstructResult:
         mesh_triangles=len(mesh.triangles),
     )
     logger.info(
-        "Done. %d/%d frames registered, %d points, mesh %d verts / %d tris. Method: %s",
-        result.num_registered,
-        result.num_frames,
-        result.num_points,
-        result.mesh_vertices,
-        result.mesh_triangles,
-        result.dense_method,
+        "\n%s",
+        progress.render_summary(
+            [
+                f"frames extracted: {result.num_frames}",
+                f"cameras registered: {result.num_registered}",
+                f"point cloud: {result.num_points} points ({result.dense_method})",
+                (
+                    f"mesh: {result.mesh_vertices} vertices, "
+                    f"{result.mesh_triangles} triangles"
+                ),
+                f"mesh.ply: {result.mesh_ply}",
+                f"mesh.obj: {result.mesh_obj}",
+                f"pointcloud.ply: {result.pointcloud_ply}",
+                f"cameras.json: {result.cameras_json}",
+                f"cameras.csv: {result.cameras_csv}",
+                f"sparse model: {result.sparse_dir}",
+                f"log.txt: {output / 'log.txt'}",
+            ]
+        ),
     )
-    logger.info("Mesh: %s", mesh_ply)
-    logger.info("Cameras: %s", result.cameras_json)
     return result
+
+
+def _write_poses(config, output, pointcloud_path, cloud, sfm: SfmOutput, extraction: FrameExtraction, dense_method: str):
+    write_point_cloud(pointcloud_path, cloud)
+    return write_cameras(
+        output / "cameras.json",
+        output / "cameras.csv",
+        source_video=config.video,
+        reconstruction=sfm.reconstruction,
+        extracted=extraction.frames,
+        sparse_dir=sfm.model_dir,
+        dense_method=dense_method,
+    )
 
 
 def _prepare_output(path: Path, overwrite: bool) -> Path:

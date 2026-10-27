@@ -98,11 +98,29 @@ python -m video2mesh reconstruct D:\videos\room.mp4 -o D:\work\cur\video2mesh\ou
 
 Then raise quality once that succeeds.
 
-Open the result (needs a desktop session, not a remote terminal without a display):
+Open the result (needs a desktop session, not a remote terminal without a display). The window is Open3D, so the `opencv-python-headless` install is enough; the viewer does not call `cv2.imshow`.
 
 ```powershell
 python -m video2mesh view D:\work\cur\video2mesh\out
+python -m video2mesh view D:\work\cur\video2mesh\out --frame 12
+python -m video2mesh view --help
 ```
+
+The same key list is printed in the terminal when the window opens:
+
+| Key | Action |
+| --- | --- |
+| W / S | Pitch up / down around the look-at point. A held key repeats. |
+| A / D | Yaw left / right around the look-at point. |
+| Q / E | Zoom in / out. |
+| R | Reset the view. |
+| Left / Right, N / P, [ / ] | Previous / next registered frame. |
+| F | Show that frame's photo as a textured plane in its frustum. |
+| H | Hide or show the projected points. |
+| C | Color points by their RGB or by depth. |
+| G | Switch the overlay between sparse points and `pointcloud.ply`. |
+
+Mouse left-drag still orbits, right-drag pans, and the wheel zooms. The side panel draws `out/frames/<filename>` and projects points with that frame's pose and intrinsics, distortion included. `out/dense/images` are undistorted, so they are not used for this check. Sparse points come from the model named in `cameras.json` (for example `sparse/3`); a Windows path recorded on another drive is matched by the folder name. Extra COLMAP 4 files (`frames.bin`, `rigs.bin`, and the text copies) are ignored.
 
 ## What you get
 
@@ -137,13 +155,13 @@ COLMAP's convention is world-to-camera: `X_cam = R X_world + t`. The camera cent
 
 Frames that COLMAP could not register are listed in `unregistered_frames` and omitted from `frames`.
 
-`sparse_model` in `cameras.json` is the model that was meshed (the largest one, when mapping produces more than one). That folder holds COLMAP's binary files and a text copy: `cameras.txt`, `images.txt`, and `points3D.txt`.
+`sparse_model` in `cameras.json` is the model that was meshed (the largest one, when mapping produces more than one). That folder holds COLMAP's binary files and a text copy: `cameras.txt`, `images.txt`, and `points3D.txt`. COLMAP 4 also writes `frames` and `rigs` (`.bin` and `.txt`) beside those files, including under `dense/sparse`. video2mesh only reads cameras, images, and points3D, so the extra files are left untouched.
 
 ## Command
 
 ```text
 video2mesh reconstruct VIDEO -o OUTPUT_DIR [options]
-video2mesh view OUTPUT_DIR [--scale METERS] [--point-cloud]
+video2mesh view OUTPUT_DIR [--scale METERS] [--point-cloud] [--frame N]
 ```
 
 | Flag | Default | Meaning |
@@ -162,9 +180,14 @@ video2mesh view OUTPUT_DIR [--scale METERS] [--point-cloud]
 | `--backend` | auto | `cli` (the `colmap` executable) or `pycolmap`. |
 | `--overwrite` | off | Replace a non-empty output directory. |
 | `--view` | off | Open the viewer at the end of a successful run. |
+| `--frame` | 1 | `view` only. 1-based registered frame to select when the window opens. |
 | `--colmap-exe`, `--ffmpeg-exe` | PATH | Explicit tool paths. |
 
-Exit code `2` means COLMAP or ffmpeg is missing. Exit code `1` means the video or the reconstruction failed. `log.txt` in the output folder has the COLMAP transcript.
+Exit code `2` means COLMAP or ffmpeg is missing. Exit code `1` means the video or the reconstruction failed.
+
+Progress is plain log lines, so it stays readable in PowerShell and in `log.txt`. Each step starts with a banner such as `Stage 3 of 8: matching` and ends with how long it took. Frame extraction counts images (`extracted 42/150`). COLMAP prints processed images, match blocks, and registered images as they happen. If a COLMAP step goes quiet, a heartbeat with the elapsed time is written about every 20 seconds. The full tool output is still in `log.txt`.
+
+A successful run ends with a summary: frames extracted, cameras registered, point-cloud size, mesh vertex and triangle counts, the output paths (`mesh.ply`, `cameras.json`, and the rest), and the wall time for the whole run and for each stage. A failed run names the stage, the command that exited, and one next step.
 
 ## Dense cloud
 
@@ -230,7 +253,8 @@ A no-CUDA run of that clip (16 frames, 640×480, default `SIMPLE_RADIAL` model, 
 | `video2mesh/dense.py` | patch-match or CPU stereo |
 | `video2mesh/mesh.py` | Poisson and ball pivoting |
 | `video2mesh/export.py` | `.ply`, `.obj`, JSON, CSV |
-| `video2mesh/viewer.py` | mesh plus camera frustums |
+| `video2mesh/viewer.py` | Open3D window: mesh, frustums, frame overlay |
+| `video2mesh/viewmath.py` | projection, orbit, and viewer key map |
 | `video2mesh/cli.py` | argument parser |
 
 ## When reconstruction fails

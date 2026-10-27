@@ -8,6 +8,7 @@ import numpy as np
 import open3d as o3d
 
 from video2mesh.errors import ReconstructionError
+from video2mesh.progress import call_with_heartbeat, should_log_tick
 
 logger = logging.getLogger("video2mesh")
 
@@ -26,6 +27,7 @@ def orient_and_mesh(
     stored under the key ``mesh``. A second method is stored as ``bpa`` when
     both are requested.
     """
+    logger.info("estimating normals for %d points", len(cloud.points))
     prepared = prepare_cloud(cloud, camera_centers)
     depth = _depth_for_size(poisson_depth, len(prepared.points))
     meshes: dict[str, o3d.geometry.TriangleMesh] = {}
@@ -80,17 +82,24 @@ def poisson_reconstruct(
     depth: int,
     trim_quantile: float,
 ) -> o3d.geometry.TriangleMesh:
-    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-        cloud,
-        depth=int(depth),
-        scale=1.1,
-        linear_fit=False,
+    logger.info("running Poisson reconstruction (depth %d)", int(depth))
+    mesh, densities = call_with_heartbeat(
+        "Poisson reconstruction",
+        lambda: o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+            cloud,
+            depth=int(depth),
+            scale=1.1,
+            linear_fit=False,
+        ),
     )
     densities = np.asarray(densities)
     if trim_quantile > 0 and densities.size == len(mesh.vertices) and densities.size > 0:
         threshold = float(np.quantile(densities, trim_quantile))
+        logger.info("trimming vertices below density quantile %.3f", trim_quantile)
         mesh.remove_vertices_by_mask(densities < threshold)
+    logger.info("cropping mesh to the point cloud")
     mesh = _crop_to_cloud(mesh, cloud, margin=0.08)
+    logger.info("keeping the largest connected component")
     mesh = _largest_component(mesh)
     _cleanup(mesh)
     _paint_from_cloud(mesh, cloud)
@@ -111,7 +120,11 @@ def ball_pivot_reconstruct(cloud: o3d.geometry.PointCloud) -> o3d.geometry.Trian
     if spacing <= 0:
         spacing = 1e-3
     radii = o3d.utility.DoubleVector([spacing * 1.5, spacing * 3.0, spacing * 6.0])
-    mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(cloud, radii)
+    logger.info("running ball-pivoting reconstruction")
+    mesh = call_with_heartbeat(
+        "ball pivoting",
+        lambda: o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(cloud, radii),
+    )
     mesh = _largest_component(mesh)
     _cleanup(mesh)
     _paint_from_cloud(mesh, cloud)
@@ -183,10 +196,15 @@ def _paint_from_cloud(mesh: o3d.geometry.TriangleMesh, cloud: o3d.geometry.Point
         return
     tree = o3d.geometry.KDTreeFlann(cloud)
     colors = np.asarray(cloud.colors)
-    painted = np.empty((len(mesh.vertices), 3), dtype=np.float64)
-    for index, vertex in enumerate(np.asarray(mesh.vertices)):
+    vertices = np.asarray(mesh.vertices)
+    total = len(vertices)
+    logger.info("coloring %d mesh vertices", total)
+    painted = np.empty((total, 3), dtype=np.float64)
+    for index, vertex in enumerate(vertices, start=1):
         _count, indices, _dist = tree.search_knn_vector_3d(vertex, 1)
-        painted[index] = colors[indices[0]] if indices else (0.7, 0.7, 0.7)
+        painted[index - 1] = colors[indices[0]] if indices else (0.7, 0.7, 0.7)
+        if should_log_tick(index, total):
+            logger.info("colored %d/%d mesh vertices", index, total)
     mesh.vertex_colors = o3d.utility.Vector3dVector(painted)
 
 

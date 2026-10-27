@@ -21,6 +21,7 @@ from video2mesh.colmap_options import (
 from video2mesh.config import SFM_TIPS
 from video2mesh.deps import command_argv, require_colmap, run_command
 from video2mesh.errors import MissingDependencyError, ReconstructionError
+from video2mesh.progress import RunProgress, call_with_heartbeat
 
 logger = logging.getLogger("video2mesh")
 
@@ -42,6 +43,7 @@ def run_sfm(
     use_gpu: bool,
     backend: str,
     colmap_exe: str | None,
+    progress: RunProgress | None = None,
 ) -> SfmOutput:
     """Run sequential SfM and return the largest reconstructed model."""
     database = workspace / "database.db"
@@ -61,6 +63,7 @@ def run_sfm(
             preset=preset,
             camera_model=camera_model,
             use_gpu=use_gpu,
+            progress=progress,
         )
     else:
         exe = None
@@ -71,6 +74,7 @@ def run_sfm(
             preset=preset,
             camera_model=camera_model,
             use_gpu=use_gpu,
+            progress=progress,
         )
 
     model_dir = _select_largest_model(sparse_root, exe)
@@ -93,6 +97,10 @@ def run_sfm(
         len(reconstruction.cameras),
         len(reconstruction.frames),
         len(reconstruction.points),
+    )
+    _stage_finish(
+        progress,
+        f"{len(reconstruction.frames)} images, {len(reconstruction.points)} points",
     )
     _log_intrinsics(reconstruction)
     return SfmOutput(
@@ -133,7 +141,11 @@ def undistort_images(
                 option("max_image_size", ("max_image_size", "Undistortion.max_image_size"), max_image_size),
             ],
         )
-        run_command(command_argv(exe, argv), echo="info")
+        run_command(
+            command_argv(exe, argv),
+            echo="progress",
+            label="colmap image_undistorter",
+        )
     else:
         try:
             import pycolmap
@@ -146,7 +158,11 @@ def undistort_images(
                 "This pycolmap build has no undistort_images. Dense stereo will use the original frames."
             )
             return None
-        pycolmap.undistort_images(str(dense_dir), str(model_dir), str(image_dir))
+        logger.info("running pycolmap undistort_images")
+        call_with_heartbeat(
+            "pycolmap undistort",
+            lambda: pycolmap.undistort_images(str(dense_dir), str(model_dir), str(image_dir)),
+        )
 
     undistorted_model = dense_dir / "sparse"
     if not undistorted_model.exists():
@@ -184,9 +200,11 @@ def _run_cli(
     preset: dict,
     camera_model: str,
     use_gpu: bool,
+    progress: RunProgress | None,
 ) -> None:
     gpu_flag = "1" if use_gpu else "0"
     cli = ColmapCli(exe)
+    _stage_start(progress, "feature extraction")
     logger.info("COLMAP feature_extractor (gpu=%s, model=%s)", gpu_flag, camera_model)
     extract_argv = ["feature_extractor"]
     cli.add(
@@ -202,7 +220,13 @@ def _run_cli(
             option("feature_use_gpu", FEATURE_USE_GPU, gpu_flag),
         ],
     )
-    run_command(command_argv(exe, extract_argv), echo="info")
+    run_command(
+        command_argv(exe, extract_argv),
+        echo="progress",
+        label="colmap feature_extractor",
+    )
+    _stage_finish(progress)
+    _stage_start(progress, "matching")
     logger.info(
         "COLMAP sequential_matcher (overlap=%s)",
         preset["sequential_overlap"],
@@ -218,7 +242,13 @@ def _run_cli(
             option("matching_use_gpu", MATCH_USE_GPU, gpu_flag),
         ],
     )
-    run_command(command_argv(exe, match_argv), echo="info")
+    run_command(
+        command_argv(exe, match_argv),
+        echo="progress",
+        label="colmap sequential_matcher",
+    )
+    _stage_finish(progress)
+    _stage_start(progress, "mapping")
     logger.info("COLMAP mapper")
     map_argv = ["mapper"]
     cli.add(
@@ -237,7 +267,11 @@ def _run_cli(
             option("ba_refine_principal_point", "Mapper.ba_refine_principal_point", "0"),
         ],
     )
-    run_command(command_argv(exe, map_argv), echo="info")
+    run_command(
+        command_argv(exe, map_argv),
+        echo="progress",
+        label="colmap mapper",
+    )
 
 
 def _run_pycolmap(
@@ -248,6 +282,7 @@ def _run_pycolmap(
     preset: dict,
     camera_model: str,
     use_gpu: bool,
+    progress: RunProgress | None,
 ) -> None:
     try:
         import pycolmap
@@ -257,6 +292,7 @@ def _run_pycolmap(
             "or run: pip install pycolmap"
         ) from exc
 
+    _stage_start(progress, "feature extraction")
     logger.info("pycolmap feature extraction")
     extract_kwargs: dict = {}
     if hasattr(pycolmap, "CameraMode"):
@@ -267,12 +303,17 @@ def _run_pycolmap(
     extraction = _extraction_options(pycolmap, preset, use_gpu)
     if extraction is not None:
         extract_kwargs["extraction_options"] = extraction
-    _invoke(pycolmap.extract_features, str(database), str(image_dir), **extract_kwargs)
+    call_with_heartbeat(
+        "pycolmap feature extraction",
+        lambda: _invoke(pycolmap.extract_features, str(database), str(image_dir), **extract_kwargs),
+    )
+    _stage_finish(progress)
 
     if not hasattr(pycolmap, "match_sequential"):
         raise ReconstructionError(
             "This pycolmap version has no match_sequential. Upgrade pycolmap or use the COLMAP executable."
         )
+    _stage_start(progress, "matching")
     logger.info("pycolmap sequential matching")
     match_kwargs: dict = {}
     matching = _matching_options(pycolmap, use_gpu)
@@ -282,17 +323,25 @@ def _run_pycolmap(
     if sequential is not None:
         match_kwargs["pairing_options"] = sequential
         match_kwargs["sequential_options"] = sequential
-    _invoke(pycolmap.match_sequential, str(database), **match_kwargs)
+    call_with_heartbeat(
+        "pycolmap sequential matching",
+        lambda: _invoke(pycolmap.match_sequential, str(database), **match_kwargs),
+    )
+    _stage_finish(progress)
 
+    _stage_start(progress, "mapping")
     logger.info("pycolmap incremental mapping")
     options = _pipeline_options(pycolmap, preset)
     map_kwargs = {"options": options} if options is not None else {}
-    reconstructions = _invoke(
-        pycolmap.incremental_mapping,
-        str(database),
-        str(image_dir),
-        str(sparse_root),
-        **map_kwargs,
+    reconstructions = call_with_heartbeat(
+        "pycolmap incremental mapping",
+        lambda: _invoke(
+            pycolmap.incremental_mapping,
+            str(database),
+            str(image_dir),
+            str(sparse_root),
+            **map_kwargs,
+        ),
     )
     if not list_model_dirs(sparse_root) and isinstance(reconstructions, dict):
         for key, reconstruction in reconstructions.items():
@@ -347,7 +396,11 @@ def _ensure_text_model(model_dir: Path, colmap_exe: str | None) -> None:
                 option("output_type", "output_type", "TXT"),
             ],
         )
-        run_command(command_argv(colmap_exe, convert_argv), echo="info")
+        run_command(
+            command_argv(colmap_exe, convert_argv),
+            echo="progress",
+            label="colmap model_converter",
+        )
         return
     try:
         import pycolmap
@@ -480,6 +533,16 @@ def _log_intrinsics(reconstruction: Reconstruction) -> None:
                 camera.width,
                 camera.height,
             )
+
+
+def _stage_start(progress: RunProgress | None, name: str) -> None:
+    if progress is not None:
+        progress.start(name)
+
+
+def _stage_finish(progress: RunProgress | None, detail: str = "") -> None:
+    if progress is not None:
+        progress.finish(detail)
 
 
 def _assign(obj, values: dict) -> None:

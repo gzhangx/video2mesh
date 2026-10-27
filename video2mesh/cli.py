@@ -135,7 +135,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     reconstruct.set_defaults(func=_cmd_reconstruct)
 
-    view = sub.add_parser("view", help="Show a mesh and camera frustums in an Open3D window")
+    from video2mesh.viewmath import VIEW_HELP
+
+    view = sub.add_parser(
+        "view",
+        help="Show the mesh, camera frustums, and a per-frame point overlay",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=(
+            "Open the reconstruction in an Open3D window. "
+            "The side panel projects 3D points onto each source frame."
+        ),
+        epilog=VIEW_HELP,
+    )
     view.add_argument("output", type=Path, help="Directory produced by reconstruct")
     view.add_argument(
         "--scale",
@@ -148,6 +159,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Draw pointcloud.ply instead of mesh.ply",
     )
+    view.add_argument(
+        "--frame",
+        type=int,
+        default=1,
+        help="Registered frame to select first, counting from 1 (default: 1).",
+    )
     view.set_defaults(func=_cmd_view)
     return parser
 
@@ -157,12 +174,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         args.func(args)
-    except MissingDependencyError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
     except Video2MeshError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
+        # reconstruct() already wrote the stage, the command, and a hint.
+        if not getattr(exc, "logged", False):
+            print(f"error: {exc}", file=sys.stderr)
+        return 2 if isinstance(exc, MissingDependencyError) else 1
     return 0
 
 
@@ -191,13 +207,6 @@ def _cmd_reconstruct(args: argparse.Namespace) -> None:
     from video2mesh.pipeline import reconstruct
 
     result = reconstruct(config)
-    print(f"mesh: {result.mesh_ply}")
-    print(f"point cloud: {result.pointcloud_ply}")
-    print(f"cameras: {result.cameras_json}")
-    print(
-        f"registered {result.num_registered}/{result.num_frames} frames, "
-        f"{result.num_points} points, dense method {result.dense_method}"
-    )
     if config.view:
         from video2mesh.viewer import view_reconstruction
 
@@ -211,6 +220,7 @@ def _cmd_view(args: argparse.Namespace) -> None:
         args.output,
         frustum_scale=args.scale,
         prefer_point_cloud=args.point_cloud,
+        frame_number=args.frame,
     )
 
 

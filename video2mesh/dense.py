@@ -108,7 +108,14 @@ def stereo_point_cloud(
     chunks_rgb: list[np.ndarray] = []
     pairs = _pair_indexes(len(views))
     logger.info("CPU stereo on %d image pairs", len(pairs))
-    for left_index, right_index in pairs:
+    for pair_index, (left_index, right_index) in enumerate(pairs, start=1):
+        logger.info(
+            "stereo pair %d/%d (%s / %s)",
+            pair_index,
+            len(pairs),
+            views[left_index].pose.name,
+            views[right_index].pose.name,
+        )
         try:
             xyz, rgb = _match_pair(views[left_index], views[right_index], num_disp, stride)
         except cv2.error as exc:
@@ -345,7 +352,6 @@ def _try_patch_match(workspace: Path, colmap_exe: str | None) -> o3d.geometry.Po
     fused_path = dense_dir / "fused.ply"
     try:
         cli = ColmapCli(exe)
-        logger.info("COLMAP patch_match_stereo")
         patch_argv = ["patch_match_stereo"]
         cli.add(
             patch_argv,
@@ -357,8 +363,11 @@ def _try_patch_match(workspace: Path, colmap_exe: str | None) -> o3d.geometry.Po
                 option("geom_consistency", "PatchMatchStereo.geom_consistency", "1"),
             ],
         )
-        run_command(command_argv(exe, patch_argv), echo="info")
-        logger.info("COLMAP stereo_fusion")
+        run_command(
+            command_argv(exe, patch_argv),
+            echo="progress",
+            label="colmap patch_match_stereo",
+        )
         fuse_argv = ["stereo_fusion"]
         cli.add(
             fuse_argv,
@@ -370,7 +379,11 @@ def _try_patch_match(workspace: Path, colmap_exe: str | None) -> o3d.geometry.Po
                 option("output_path", "output_path", fused_path),
             ],
         )
-        run_command(command_argv(exe, fuse_argv), echo="info")
+        run_command(
+            command_argv(exe, fuse_argv),
+            echo="progress",
+            label="colmap stereo_fusion",
+        )
     except ReconstructionError as exc:
         logger.warning("Patch-match stereo failed:\n%s", exc)
         return None

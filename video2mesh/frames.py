@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,8 +14,11 @@ import numpy as np
 
 from video2mesh.deps import FFMPEG_INSTALL_HELP, command_argv, find_ffmpeg, run_command
 from video2mesh.errors import ReconstructionError
+from video2mesh.progress import should_log_tick
 
 logger = logging.getLogger("video2mesh")
+
+_FFMPEG_FRAME = re.compile(r"^frame=\s*(\d+)\s*$")
 
 
 @dataclass
@@ -77,6 +81,7 @@ def extract_frames(
     video_fps = meta[0] if meta else 0.0
     frame_count = meta[1] if meta else 0
     effective_fps = _effective_fps(fps, video_fps, frame_count, max_frames)
+    expected = _expected_extract_count(video_fps, frame_count, effective_fps, max_frames)
     logger.info(
         "Extracting frames at %.3f fps (video %.3f fps, %s frames), cap %d",
         effective_fps,
@@ -84,12 +89,14 @@ def extract_frames(
         frame_count if frame_count else "unknown",
         max_frames,
     )
+    if expected:
+        logger.info("about %d frames to extract", expected)
 
     ffmpeg = find_ffmpeg(ffmpeg_exe) if use_ffmpeg else None
     extractor = ""
     if ffmpeg is not None:
         try:
-            _extract_ffmpeg(ffmpeg, video, frames_dir, effective_fps)
+            _extract_ffmpeg(ffmpeg, video, frames_dir, effective_fps, expected)
             extractor = "ffmpeg"
         except ReconstructionError as exc:
             logger.warning("ffmpeg extraction failed (%s). Trying OpenCV.", exc)
@@ -100,7 +107,7 @@ def extract_frames(
                 "OpenCV could not open the video and ffmpeg did not produce frames.\n"
                 + FFMPEG_INSTALL_HELP.strip()
             )
-        _extract_opencv(video, frames_dir, video_fps, effective_fps, max_frames)
+        _extract_opencv(video, frames_dir, video_fps, effective_fps, max_frames, expected)
         extractor = "opencv"
 
     paths = sorted(frames_dir.glob("frame_*.jpg"))
@@ -194,13 +201,31 @@ def _effective_fps(requested: float, video_fps: float, frame_count: int, max_fra
     return max(effective, 1e-3)
 
 
-def _extract_ffmpeg(ffmpeg: str, video: Path, frames_dir: Path, fps: float) -> None:
+def _extract_ffmpeg(
+    ffmpeg: str,
+    video: Path,
+    frames_dir: Path,
+    fps: float,
+    expected: int | None,
+) -> None:
     pattern = str(frames_dir / "frame_%06d.jpg")
+    seen = {"n": 0}
+
+    def on_line(line: str) -> None:
+        match = _FFMPEG_FRAME.match(line.strip())
+        if not match:
+            return
+        done = int(match.group(1))
+        seen["n"] = done
+        if should_log_tick(done, expected):
+            logger.info("extracted %s", _count_label(done, expected))
+
     run_command(
         command_argv(
             ffmpeg,
             [
                 "-hide_banner",
+                "-nostats",
                 "-loglevel",
                 "error",
                 "-y",
@@ -210,12 +235,20 @@ def _extract_ffmpeg(ffmpeg: str, video: Path, frames_dir: Path, fps: float) -> N
                 f"fps={fps:.6f}",
                 "-q:v",
                 "2",
+                "-progress",
+                "pipe:1",
                 pattern,
             ],
-        )
+        ),
+        echo="progress",
+        label="ffmpeg frame extraction",
+        on_line=on_line,
     )
-    if not any(frames_dir.glob("frame_*.jpg")):
+    written = len(list(frames_dir.glob("frame_*.jpg")))
+    if written <= 0:
         raise ReconstructionError("ffmpeg exited successfully but wrote no frames.")
+    if written != seen["n"]:
+        logger.info("extracted %s", _count_label(written, expected))
 
 
 def _extract_opencv(
@@ -224,6 +257,7 @@ def _extract_opencv(
     video_fps: float,
     target_fps: float,
     max_frames: int,
+    expected: int | None,
 ) -> None:
     capture = cv2.VideoCapture(str(video))
     if not capture.isOpened():
@@ -243,8 +277,12 @@ def _extract_opencv(
             if not cv2.imwrite(str(path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95]):
                 capture.release()
                 raise ReconstructionError(f"Failed to write {path}")
+            if should_log_tick(written, expected):
+                logger.info("extracted %s", _count_label(written, expected))
         index += 1
     capture.release()
+    if written and not should_log_tick(written, expected):
+        logger.info("extracted %s", _count_label(written, expected))
 
 
 def _subsample_paths(paths: list[Path], keep: int) -> list[Path]:
@@ -268,7 +306,11 @@ def _score_resize_and_renumber(
     max_image_size: int,
 ) -> list[ExtractedFrame]:
     staged: list[tuple[Path, float, int]] = []
-    for path in paths:
+    total = len(paths)
+    logger.info("scoring %d frames", total)
+    for index, path in enumerate(paths, start=1):
+        if should_log_tick(index, total):
+            logger.info("scored %d/%d", index, total)
         image = cv2.imread(str(path), cv2.IMREAD_COLOR)
         if image is None:
             logger.warning("Skipping unreadable frame %s", path.name)
@@ -318,6 +360,27 @@ def _score_resize_and_renumber(
             )
         )
     return records
+
+
+def _expected_extract_count(
+    video_fps: float,
+    frame_count: int,
+    effective_fps: float,
+    max_frames: int,
+) -> int | None:
+    if video_fps <= 0 or frame_count <= 0 or effective_fps <= 0:
+        return None
+    duration = frame_count / video_fps
+    estimate = int(round(duration * effective_fps))
+    if max_frames > 0:
+        estimate = min(estimate, max_frames)
+    return max(estimate, 1)
+
+
+def _count_label(done: int, total: int | None) -> str:
+    if total:
+        return f"{done}/{total}"
+    return str(done)
 
 
 def _ordinal(path: Path) -> int:
