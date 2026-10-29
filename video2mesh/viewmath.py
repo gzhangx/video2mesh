@@ -37,9 +37,10 @@ Keys (held keys repeat):
   G           use sparse points or pointcloud.ply
 Mouse: left-drag orbits, right-drag pans, wheel zooms.
 The Show image checkbox does the same thing as F. The photo is drawn on that
-camera's image plane, just behind the scene, and the view moves to that camera
-so the picture lines up with the mesh. Changing frame while it is on looks
-through the new camera.
+camera's image plane, just behind the scene, and the mesh is drawn transparent
+so the picture shows through. The view moves to that camera. Rotate 180° turns
+the photo half a turn. Changing frame while the image is on looks through the
+new camera.
 
 The side panel shows the original frame from out/frames. Points are projected
 with that frame's pose and intrinsics, including lens distortion. Images in
@@ -463,6 +464,11 @@ def background_plane_depth(frame: dict, points: np.ndarray, minimum: float) -> f
         return floor
     far = float(np.max(ahead))
     return max(far + max(far * 0.02, 1e-3), floor)
+
+
+def half_turn(image: np.ndarray) -> np.ndarray:
+    """Rotate an image 180 degrees. Opposite corners trade places."""
+    return np.ascontiguousarray(np.rot90(image, 2))
 
 
 def render_overlay(

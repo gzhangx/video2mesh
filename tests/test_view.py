@@ -21,6 +21,7 @@ from video2mesh.viewmath import (
     dolly_camera,
     fly_camera,
     fly_distance,
+    half_turn,
     image_plane_corners,
     image_plane_mesh,
     interpret_key,
@@ -159,6 +160,16 @@ def test_camera_view_looks_through_the_frame_upright():
     points = np.array([[0.0, 0.0, 2.0], [0.0, 0.0, 5.0], [0.0, 0.0, -1.0]])
     assert background_plane_depth(_frame(), points, minimum=0.2) == pytest.approx(5.1)
     assert background_plane_depth(_frame(), np.zeros((0, 3)), minimum=0.4) == pytest.approx(0.4)
+
+
+def test_half_turn_swaps_opposite_corners():
+    image = np.zeros((4, 6, 3), dtype=np.uint8)
+    image[0, 0] = (1, 2, 3)
+    image[3, 5] = (4, 5, 6)
+    turned = half_turn(image)
+    assert turned[3, 5].tolist() == [1, 2, 3]
+    assert turned[0, 0].tolist() == [4, 5, 6]
+    assert turned.flags["C_CONTIGUOUS"]
 
 
 def test_orbit_yaw_pitch_zoom_and_pose_matrix():

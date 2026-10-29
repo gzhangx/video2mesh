@@ -25,6 +25,7 @@ from video2mesh.viewmath import (
     fly_camera,
     fly_distance,
     frame_caption,
+    half_turn,
     image_plane_corners,
     image_plane_mesh,
     interpret_key,
@@ -199,6 +200,7 @@ class _ReconstructionWindow:
         self._panel_width = 480
         self._bgr_cache: dict[int, tuple[np.ndarray, bool]] = {}
         self._checkbox_guard = False
+        self.flip_upright = False
 
     def run(self) -> None:
         import open3d.visualization.gui as gui
@@ -221,9 +223,20 @@ class _ReconstructionWindow:
             "Draw this frame's photo on its image plane and look through the camera"
         )
         self.show_image.set_on_checked(self._on_show_image)
+        self.flip_image = gui.Checkbox("Rotate 180")
+        self.flip_image.checked = self.flip_upright
+        self.flip_image.tooltip = "Turn the photo upright by rotating it 180 degrees"
+        self.flip_image.set_on_checked(self._on_flip_image)
         self.image = gui.ImageWidget()
         self._lit = rendering.MaterialRecord()
         self._lit.shader = "defaultLit"
+        # Lit transparency. defaultUnlitTransparency has no srgbColor uniform,
+        # and Open3D 0.20 aborts when it sets one.
+        self._lit_ghost = rendering.MaterialRecord()
+        self._lit_ghost.shader = "defaultLitTransparency"
+        self._lit_ghost.base_color = [1.0, 1.0, 1.0, 0.35]
+        self._lit_ghost.base_roughness = 0.7
+        self._lit_ghost.base_metallic = 0.0
         self._points = rendering.MaterialRecord()
         self._points.shader = "defaultUnlit"
         self._points.point_size = 3.0
@@ -254,6 +267,7 @@ class _ReconstructionWindow:
         self.scene.setup_camera(60.0, box, self._reset_center)
         self.window.add_child(self.scene)
         self.window.add_child(self.show_image)
+        self.window.add_child(self.flip_image)
         self.window.add_child(self.label)
         self.window.add_child(self.image)
         self.window.set_on_layout(self._on_layout)
@@ -271,8 +285,10 @@ class _ReconstructionWindow:
         x = rect.get_right() - panel
         self.scene.frame = gui.Rect(rect.x, rect.y, max(1, rect.width - panel), rect.height)
         self.show_image.frame = gui.Rect(x + 8, rect.y + 4, max(1, panel - 8), check_h)
-        self.label.frame = gui.Rect(x + 8, rect.y + 4 + check_h, max(1, panel - 16), label_h)
-        image_top = 4 + check_h + label_h
+        self.flip_image.frame = gui.Rect(x + 8, rect.y + 4 + check_h, max(1, panel - 8), check_h)
+        text_top = 4 + 2 * check_h
+        self.label.frame = gui.Rect(x + 8, rect.y + text_top, max(1, panel - 16), label_h)
+        image_top = text_top + label_h
         self.image.frame = gui.Rect(x, rect.y + image_top, panel, max(1, rect.height - image_top))
         if abs(panel - self._panel_width) > 8:
             self._panel_width = panel
@@ -335,6 +351,11 @@ class _ReconstructionWindow:
             len(self.overlay.frames),
         )
         self._commit_overlay(previous, aim=self.state.show_photo)
+        self.window.post_redraw()
+
+    def _on_flip_image(self, checked: bool) -> None:
+        self.flip_upright = bool(checked)
+        self._refresh_overlay()
         self.window.post_redraw()
 
     def _commit_overlay(self, previous: int, *, aim: bool) -> None:
@@ -424,15 +445,31 @@ class _ReconstructionWindow:
         name = "frame-photo"
         scene = self.scene.scene
         if not self.state.show_photo:
+            self._apply_model_opacity()
             if scene.has_geometry(name):
                 scene.show_geometry(name, False)
             return
+        self._apply_model_opacity()
         rgb = cv2_rgb(bgr)
+        if self.flip_upright:
+            rgb = half_turn(rgb)
         mesh = image_plane_mesh(frame, rgb, self._photo_depth(frame))
         if scene.has_geometry(name):
             scene.remove_geometry(name)
         self._photo_mat.albedo_img = o3d.geometry.Image(np.ascontiguousarray(rgb))
         scene.add_geometry(name, mesh, self._photo_mat)
+
+    def _apply_model_opacity(self) -> None:
+        """Ghost the model while the photo is on so the picture shows through."""
+        model = self.geometries[0]
+        if self.state.show_photo:
+            material = self._lit_ghost
+        elif isinstance(model, o3d.geometry.PointCloud):
+            material = self._points
+        else:
+            material = self._lit
+        if self.scene.scene.has_geometry("model"):
+            self.scene.scene.modify_geometry_material("model", material)
 
     def _photo_depth(self, frame: dict) -> float:
         return background_plane_depth(frame, _box_corners(self._reset_bounds), self.scale)
