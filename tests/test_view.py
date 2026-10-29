@@ -21,6 +21,7 @@ from video2mesh.viewmath import (
     dolly_camera,
     fly_camera,
     fly_distance,
+    frustum_visible,
     half_turn,
     image_plane_corners,
     image_plane_mesh,
@@ -160,6 +161,14 @@ def test_camera_view_looks_through_the_frame_upright():
     points = np.array([[0.0, 0.0, 2.0], [0.0, 0.0, 5.0], [0.0, 0.0, -1.0]])
     assert background_plane_depth(_frame(), points, minimum=0.2) == pytest.approx(5.1)
     assert background_plane_depth(_frame(), np.zeros((0, 3)), minimum=0.4) == pytest.approx(0.4)
+
+
+def test_image_mode_keeps_only_the_current_frustum():
+    assert frustum_visible(0, 1, False)
+    assert frustum_visible(2, 1, False)
+    assert frustum_visible(1, 1, True)
+    assert not frustum_visible(0, 1, True)
+    assert not frustum_visible(2, 1, True)
 
 
 def test_half_turn_swaps_opposite_corners():

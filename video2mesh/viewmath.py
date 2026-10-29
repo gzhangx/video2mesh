@@ -38,9 +38,10 @@ Keys (held keys repeat):
 Mouse: left-drag orbits, right-drag pans, wheel zooms.
 The Show image checkbox does the same thing as F. The photo is drawn on that
 camera's image plane, just behind the scene, and the mesh is drawn transparent
-so the picture shows through. The view moves to that camera. Rotate 180° turns
-the photo half a turn. Changing frame while the image is on looks through the
-new camera.
+so the picture shows through. Only that camera's frustum stays visible. The
+Mesh alpha slider changes how solid the mesh is. The view moves to that camera.
+Rotate 180 turns the photo half a turn. Changing frame while the image is on
+looks through the new camera.
 
 The side panel shows the original frame from out/frames. Points are projected
 with that frame's pose and intrinsics, including lens distortion. Images in
@@ -464,6 +465,11 @@ def background_plane_depth(frame: dict, points: np.ndarray, minimum: float) -> f
         return floor
     far = float(np.max(ahead))
     return max(far + max(far * 0.02, 1e-3), floor)
+
+
+def frustum_visible(index: int, current: int, image_mode: bool) -> bool:
+    """Other camera markers are hidden while a frame photo is shown."""
+    return (not image_mode) or index == current
 
 
 def half_turn(image: np.ndarray) -> np.ndarray:

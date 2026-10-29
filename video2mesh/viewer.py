@@ -25,6 +25,7 @@ from video2mesh.viewmath import (
     fly_camera,
     fly_distance,
     frame_caption,
+    frustum_visible,
     half_turn,
     image_plane_corners,
     image_plane_mesh,
@@ -201,6 +202,7 @@ class _ReconstructionWindow:
         self._bgr_cache: dict[int, tuple[np.ndarray, bool]] = {}
         self._checkbox_guard = False
         self.flip_upright = False
+        self.mesh_alpha = 0.35
 
     def run(self) -> None:
         import open3d.visualization.gui as gui
@@ -227,6 +229,12 @@ class _ReconstructionWindow:
         self.flip_image.checked = self.flip_upright
         self.flip_image.tooltip = "Turn the photo upright by rotating it 180 degrees"
         self.flip_image.set_on_checked(self._on_flip_image)
+        self.alpha_label = gui.Label(self._alpha_caption())
+        self.alpha_label.text_color = gui.Color(1, 1, 1)
+        self.alpha_slider = gui.Slider(gui.Slider.Type.DOUBLE)
+        self.alpha_slider.set_limits(0.0, 1.0)
+        self.alpha_slider.double_value = self.mesh_alpha
+        self.alpha_slider.set_on_value_changed(self._on_mesh_alpha)
         self.image = gui.ImageWidget()
         self._lit = rendering.MaterialRecord()
         self._lit.shader = "defaultLit"
@@ -234,7 +242,7 @@ class _ReconstructionWindow:
         # and Open3D 0.20 aborts when it sets one.
         self._lit_ghost = rendering.MaterialRecord()
         self._lit_ghost.shader = "defaultLitTransparency"
-        self._lit_ghost.base_color = [1.0, 1.0, 1.0, 0.35]
+        self._lit_ghost.base_color = [1.0, 1.0, 1.0, self.mesh_alpha]
         self._lit_ghost.base_roughness = 0.7
         self._lit_ghost.base_metallic = 0.0
         self._points = rendering.MaterialRecord()
@@ -268,6 +276,8 @@ class _ReconstructionWindow:
         self.window.add_child(self.scene)
         self.window.add_child(self.show_image)
         self.window.add_child(self.flip_image)
+        self.window.add_child(self.alpha_label)
+        self.window.add_child(self.alpha_slider)
         self.window.add_child(self.label)
         self.window.add_child(self.image)
         self.window.set_on_layout(self._on_layout)
@@ -284,9 +294,10 @@ class _ReconstructionWindow:
         label_h = max(64, em * 3)
         x = rect.get_right() - panel
         self.scene.frame = gui.Rect(rect.x, rect.y, max(1, rect.width - panel), rect.height)
-        self.show_image.frame = gui.Rect(x + 8, rect.y + 4, max(1, panel - 8), check_h)
-        self.flip_image.frame = gui.Rect(x + 8, rect.y + 4 + check_h, max(1, panel - 8), check_h)
-        text_top = 4 + 2 * check_h
+        controls = (self.show_image, self.flip_image, self.alpha_label, self.alpha_slider)
+        for row, widget in enumerate(controls):
+            widget.frame = gui.Rect(x + 8, rect.y + 4 + row * check_h, max(1, panel - 16), check_h)
+        text_top = 4 + len(controls) * check_h
         self.label.frame = gui.Rect(x + 8, rect.y + text_top, max(1, panel - 16), label_h)
         image_top = text_top + label_h
         self.image.frame = gui.Rect(x, rect.y + image_top, panel, max(1, rect.height - image_top))
@@ -358,10 +369,22 @@ class _ReconstructionWindow:
         self._refresh_overlay()
         self.window.post_redraw()
 
+    def _on_mesh_alpha(self, value: float) -> None:
+        self.mesh_alpha = min(1.0, max(0.0, float(value)))
+        self._lit_ghost.base_color = [1.0, 1.0, 1.0, self.mesh_alpha]
+        self.alpha_label.text = self._alpha_caption()
+        if self.state.show_photo:
+            self._apply_model_opacity()
+        self.window.post_redraw()
+
+    def _alpha_caption(self) -> str:
+        return f"Mesh alpha  {self.mesh_alpha:.2f}"
+
     def _commit_overlay(self, previous: int, *, aim: bool) -> None:
         if self.state.frame_index != previous:
             self._put_frustum(previous, selected=False)
             self._put_frustum(self.state.frame_index, selected=True)
+        self._sync_frustum_visibility()
         self._sync_show_image()
         self._refresh_overlay()
         if aim:
@@ -473,6 +496,16 @@ class _ReconstructionWindow:
 
     def _photo_depth(self, frame: dict) -> float:
         return background_plane_depth(frame, _box_corners(self._reset_bounds), self.scale)
+
+    def _sync_frustum_visibility(self) -> None:
+        """In image mode, keep only the camera whose photo is showing."""
+        scene = self.scene.scene
+        current = self.state.frame_index
+        image_mode = self.state.show_photo
+        for index in range(len(self.overlay.frames)):
+            name = f"frustum-{index}"
+            if scene.has_geometry(name):
+                scene.show_geometry(name, frustum_visible(index, current, image_mode))
 
     def _put_frustum(self, index: int, *, selected: bool) -> None:
         frame = self.overlay.frames[index]
