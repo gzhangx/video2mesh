@@ -10,12 +10,15 @@ from video2mesh.cli import main
 from video2mesh.colmap_io import read_model
 from video2mesh.errors import ReconstructionError
 from video2mesh.viewmath import (
+    FLY_STEP_FRACTION,
     ORBIT_STEP_DEG,
     ZOOM_IN,
     KeyEffect,
     ViewState,
     apply_key_effect,
     dolly_camera,
+    fly_camera,
+    fly_distance,
     image_plane_corners,
     image_plane_mesh,
     interpret_key,
@@ -25,6 +28,8 @@ from video2mesh.viewmath import (
     pose_from_model,
     project_points,
     render_overlay,
+    resolve_sparse_dir,
+    roll_camera,
     starting_frame_index,
 )
 
@@ -141,6 +146,8 @@ def test_orbit_yaw_pitch_zoom_and_pose_matrix():
 
     closer = dolly_camera(eye, center, ZOOM_IN)
     assert np.linalg.norm(closer) < np.linalg.norm(eye)
+    # Q/E zoom moves only the eye. The look-at point is the caller's center.
+    np.testing.assert_allclose(closer, center + (eye - center) * ZOOM_IN)
 
     look = np.array([0.0, 0.0, -1.0])
     right_axis = np.cross(look, up)
@@ -155,23 +162,60 @@ def test_orbit_yaw_pitch_zoom_and_pose_matrix():
     np.testing.assert_allclose(got_up, up)
 
 
+def test_roll_and_fly_move_the_third_axis_and_both_points():
+    eye = np.array([0.0, 0.0, 5.0])
+    center = np.zeros(3)
+    up = np.array([0.0, 1.0, 0.0])
+    # Looking toward -Z, camera-right is +X. Positive roll tilts up that way.
+    rolled_eye, rolled_up = roll_camera(eye, center, up, ORBIT_STEP_DEG)
+    np.testing.assert_allclose(rolled_eye, eye)
+    assert rolled_up[0] > 0
+    assert rolled_up[1] > 0
+    assert abs(float(np.dot(rolled_up, center - eye))) < 1e-8
+    assert np.linalg.norm(rolled_up) == pytest.approx(1.0)
+    opposite_eye, opposite_up = roll_camera(eye, center, up, -ORBIT_STEP_DEG)
+    np.testing.assert_allclose(opposite_eye, eye)
+    assert opposite_up[0] < 0
+    _, quarter = roll_camera(eye, center, up, 90.0)
+    np.testing.assert_allclose(quarter, [1.0, 0.0, 0.0], atol=1e-6)
+
+    forward_eye, forward_center = fly_camera(eye, center, 2.0)
+    np.testing.assert_allclose(forward_eye, [0.0, 0.0, 3.0])
+    np.testing.assert_allclose(forward_center, [0.0, 0.0, -2.0])
+    assert np.linalg.norm(forward_center - forward_eye) == pytest.approx(5.0)
+    back_eye, back_center = fly_camera(eye, center, -1.0)
+    np.testing.assert_allclose(back_eye, [0.0, 0.0, 6.0])
+    np.testing.assert_allclose(back_center, [0.0, 0.0, 1.0])
+    same_eye, same_center = fly_camera(eye, eye.copy(), 3.0)
+    np.testing.assert_allclose(same_eye, eye)
+    np.testing.assert_allclose(same_center, eye)
+    assert fly_distance(10.0, 1) == pytest.approx(FLY_STEP_FRACTION * 10.0)
+    assert fly_distance(10.0, -1) == pytest.approx(-FLY_STEP_FRACTION * 10.0)
+
+
 def test_key_map_and_frame_wrap():
     assert interpret_key("w").pitch_deg == ORBIT_STEP_DEG
     assert interpret_key("s").pitch_deg == -ORBIT_STEP_DEG
     assert interpret_key("a").yaw_deg == -ORBIT_STEP_DEG
     assert interpret_key("d").yaw_deg == ORBIT_STEP_DEG
+    assert interpret_key("z").roll_deg == ORBIT_STEP_DEG
+    assert interpret_key("c").roll_deg == -ORBIT_STEP_DEG
+    assert not interpret_key("c").toggle_color
+    assert interpret_key("v").toggle_color
     assert interpret_key("q").zoom_factor == ZOOM_IN
     assert interpret_key("e").zoom_factor > 1
     assert interpret_key("r").reset
+    assert interpret_key("up").fly_sign == 1
+    assert interpret_key("down").fly_sign == -1
     assert interpret_key("left").frame_delta == -1
     assert interpret_key("right").frame_delta == 1
+    assert interpret_key("left").fly_sign == 0
     assert interpret_key("n").frame_delta == 1
     assert interpret_key("p").frame_delta == -1
     assert interpret_key("[").frame_delta == -1
     assert interpret_key("]").frame_delta == 1
     assert interpret_key("f").toggle_photo
     assert interpret_key("h").toggle_points
-    assert interpret_key("c").toggle_color
     assert interpret_key("g").toggle_source
     assert interpret_key("x") is None
     assert interpret_key(None) is None
@@ -184,23 +228,33 @@ def test_key_map_and_frame_wrap():
     assert key_token(119) == "w"  # Open3D KeyName.W
     assert interpret_key(key_token(263)).frame_delta == -1  # KeyName.LEFT
     assert interpret_key(key_token(264)).frame_delta == 1  # KeyName.RIGHT
+    assert interpret_key(key_token(265)).fly_sign == 1  # KeyName.UP
+    assert interpret_key(key_token(266)).fly_sign == -1  # KeyName.DOWN
     assert interpret_key(key_token(91)).frame_delta == -1  # KeyName.LEFT_BRACKET
     assert interpret_key(key_token(ord("D"))).yaw_deg == ORBIT_STEP_DEG
+    assert interpret_key(key_token(ord("Z"))).roll_deg == ORBIT_STEP_DEG
+    assert interpret_key(key_token(ord("C"))).roll_deg == -ORBIT_STEP_DEG
+    assert interpret_key(key_token(ord("V"))).toggle_color
 
     state = ViewState()
     state = apply_key_effect(state, KeyEffect(frame_delta=-1), 4)
     assert state.frame_index == 3
     state = apply_key_effect(state, interpret_key("f"), 4)
     state = apply_key_effect(state, interpret_key("h"), 4)
-    state = apply_key_effect(state, interpret_key("c"), 4)
+    state = apply_key_effect(state, interpret_key("v"), 4)
     state = apply_key_effect(state, interpret_key("g"), 4)
     assert state.show_photo
     assert not state.show_points
     assert state.color_mode == "depth"
     assert state.point_source == "cloud"
     # A repeated key is just another call, which is what a held key does.
-    state = apply_key_effect(state, interpret_key("c"), 4)
+    state = apply_key_effect(state, interpret_key("v"), 4)
     assert state.color_mode == "rgb"
+    # Roll and fly do not change the overlay state.
+    rolled = apply_key_effect(state, interpret_key("z"), 4)
+    flown = apply_key_effect(state, interpret_key("up"), 4)
+    assert rolled == state
+    assert flown == state
 
     assert starting_frame_index(2, 5) == 1
     with pytest.raises(ReconstructionError):
@@ -218,7 +272,11 @@ def test_view_help_lists_the_keys(capsys):
     text = capsys.readouterr().out
     assert "--frame" in text
     assert "W / S" in text
-    assert "Left Right" in text
+    assert "Z / C" in text
+    assert "Up / Down" in text
+    assert "Left / Right" in text
+    color_line = next(line for line in text.splitlines() if line.strip().startswith("V "))
+    assert "color" in color_line
     assert "out/frames" in text
 
 
@@ -254,7 +312,7 @@ def test_overlay_uses_named_sparse_model_and_ignores_colmap4_files(tmp_path: Pat
         encoding="utf-8",
     )
     payload = {
-        "sparse_model": "D:\\work\\cur\\video2mesh\\out\\sparse\\3",
+        "sparse_model": "Z:\\__video2mesh_does_not_exist__\\sparse\\3",
         "frames": [
             {
                 "filename": "frame_000001.jpg",
@@ -280,3 +338,34 @@ def test_overlay_uses_named_sparse_model_and_ignores_colmap4_files(tmp_path: Pat
     # Camera at z=-2 looking along +Z. Point z=4 is 6 units in front.
     # u = 50 * (0.25 / 6) + 50.
     assert uv[0, 0] == pytest.approx(50.0 + 50.0 * 0.25 / 6.0)
+
+
+def _write_cameras_txt(model: Path) -> None:
+    model.mkdir(parents=True, exist_ok=True)
+    (model / "cameras.txt").write_text("1 PINHOLE 10 10 1 1 5 5\n", encoding="utf-8")
+
+
+def test_resolve_sparse_dir_prefers_local_folder_over_an_existing_absolute_path(tmp_path: Path):
+    output = tmp_path / "out"
+    local = output / "sparse" / "3"
+    _write_cameras_txt(local)
+    (local / "points3D.txt").write_text("1 0 0 1 1 1 1 1\n", encoding="utf-8")
+    absolute = tmp_path / "real_drive" / "sparse" / "3"
+    _write_cameras_txt(absolute)
+    (absolute / "points3D.txt").write_text(
+        "1 9 9 9 1 1 1 1\n2 8 8 8 1 1 1 1\n",
+        encoding="utf-8",
+    )
+    chosen = resolve_sparse_dir(output, str(absolute))
+    assert chosen == local
+
+
+def test_resolve_sparse_dir_falls_back_to_the_absolute_path(tmp_path: Path):
+    output = tmp_path / "moved"
+    output.mkdir()
+    absolute = tmp_path / "original" / "sparse" / "3"
+    _write_cameras_txt(absolute)
+    chosen = resolve_sparse_dir(output, str(absolute))
+    assert chosen == absolute
+    missing = resolve_sparse_dir(output, "Z:\\__video2mesh_does_not_exist__\\sparse\\3")
+    assert missing is None

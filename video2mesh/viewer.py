@@ -19,6 +19,8 @@ from video2mesh.viewmath import (
     apply_key_effect,
     dolly_camera,
     fit_display,
+    fly_camera,
+    fly_distance,
     frame_caption,
     image_plane_mesh,
     interpret_key,
@@ -27,6 +29,7 @@ from video2mesh.viewmath import (
     load_overlay,
     orbit_camera,
     pose_from_model,
+    roll_camera,
     project_points,
     render_overlay,
     starting_frame_index,
@@ -294,6 +297,19 @@ class _ReconstructionWindow:
             eye, center, up = self._pose()
             eye, up = orbit_camera(eye, center, up, effect.yaw_deg, effect.pitch_deg)
             self.scene.look_at(center.astype(np.float32), eye.astype(np.float32), up.astype(np.float32))
+        elif effect.roll_deg:
+            eye, center, up = self._pose()
+            _eye, up = roll_camera(eye, center, up, effect.roll_deg)
+            self.scene.look_at(center.astype(np.float32), eye.astype(np.float32), up.astype(np.float32))
+        elif effect.fly_sign:
+            eye, center, up = self._pose()
+            extent = np.asarray(self._reset_bounds.get_extent(), dtype=np.float64)
+            distance = fly_distance(float(np.linalg.norm(extent)), effect.fly_sign)
+            eye, center = fly_camera(eye, center, distance)
+            center32 = center.astype(np.float32)
+            self.scene.look_at(center32, eye.astype(np.float32), up.astype(np.float32))
+            # look_at leaves the orbit pivot where it was. Fly moves both.
+            self.scene.center_of_rotation = center32
         overlay_changed = any(
             (
                 effect.frame_delta,

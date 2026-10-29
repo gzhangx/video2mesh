@@ -18,18 +18,22 @@ from video2mesh.errors import ReconstructionError
 ORBIT_STEP_DEG = 4.0
 ZOOM_IN = 0.85
 ZOOM_OUT = 1.0 / ZOOM_IN
+# Fraction of the scene bounding-box diagonal moved by one Up/Down press.
+FLY_STEP_FRACTION = 0.04
 OVERLAY_POINT_LIMIT = 12000
 
 VIEW_HELP = """\
 Keys (held keys repeat):
   W / S       pitch the view up / down around the look-at point
   A / D       yaw the view left / right around the look-at point
-  Q / E       zoom in / out
+  Z / C       roll clockwise / counter-clockwise around the view direction
+  Q / E       zoom in / out (eye moves, look-at stays)
+  Up / Down   dolly forward / backward along the view (eye and look-at move together)
   R           reset the view
-  Left Right, N P, or [ ]    previous / next frame
+  Left / Right, N / P, or [ / ]    previous / next frame
   F           show this frame's photo as a plane in its frustum
   H           hide or show the projected points
-  C           color those points by RGB or by depth
+  V           color those points by RGB or by depth
   G           use sparse points or pointcloud.ply
 Mouse: left-drag orbits, right-drag pans, wheel zooms.
 
@@ -43,7 +47,9 @@ out/dense/images are undistorted, so the overlay does not use them.
 class KeyEffect:
     yaw_deg: float = 0.0
     pitch_deg: float = 0.0
+    roll_deg: float = 0.0
     zoom_factor: float | None = None
+    fly_sign: int = 0
     reset: bool = False
     frame_delta: int = 0
     toggle_photo: bool = False
@@ -107,9 +113,13 @@ def interpret_key(token: str | None) -> KeyEffect | None:
         "s": KeyEffect(pitch_deg=-step),
         "a": KeyEffect(yaw_deg=-step),
         "d": KeyEffect(yaw_deg=step),
+        "z": KeyEffect(roll_deg=step),
+        "c": KeyEffect(roll_deg=-step),
         "q": KeyEffect(zoom_factor=ZOOM_IN),
         "e": KeyEffect(zoom_factor=ZOOM_OUT),
         "r": KeyEffect(reset=True),
+        "up": KeyEffect(fly_sign=1),
+        "down": KeyEffect(fly_sign=-1),
         "left": KeyEffect(frame_delta=-1),
         "right": KeyEffect(frame_delta=1),
         "n": KeyEffect(frame_delta=1),
@@ -118,7 +128,7 @@ def interpret_key(token: str | None) -> KeyEffect | None:
         "right_bracket": KeyEffect(frame_delta=1),
         "f": KeyEffect(toggle_photo=True),
         "h": KeyEffect(toggle_points=True),
-        "c": KeyEffect(toggle_color=True),
+        "v": KeyEffect(toggle_color=True),
         "g": KeyEffect(toggle_source=True),
     }
     return table.get(name)
@@ -243,10 +253,70 @@ def orbit_camera(
 
 
 def dolly_camera(eye: np.ndarray, center: np.ndarray, factor: float) -> np.ndarray:
-    """Move the eye toward the center. ``factor`` < 1 zooms in."""
+    """Move the eye toward the center. ``factor`` < 1 zooms in.
+
+    Q/E use this. Up/Down use :func:`fly_camera`, which translates the eye
+    and the look-at point together.
+    """
     eye = np.asarray(eye, dtype=np.float64)
     center = np.asarray(center, dtype=np.float64)
     return center + (eye - center) * float(factor)
+
+
+def roll_camera(
+    eye: np.ndarray,
+    center: np.ndarray,
+    up: np.ndarray,
+    roll_deg: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Roll the camera around its view direction. Eye and look-at stay put.
+
+    Positive ``roll_deg`` is a right-hand rotation of ``up`` around
+    ``center - eye``, so the up vector tilts toward camera-right. Looking
+    along the view, that is clockwise. The returned up is unit length and
+    perpendicular to the view direction.
+    """
+    eye = np.asarray(eye, dtype=np.float64)
+    center = np.asarray(center, dtype=np.float64)
+    up = np.asarray(up, dtype=np.float64)
+    forward = center - eye
+    rolled = rotate_about(up, forward, roll_deg)
+    forward_norm = np.linalg.norm(forward)
+    if forward_norm > 1e-8:
+        forward_hat = forward / forward_norm
+        rolled = rolled - forward_hat * float(np.dot(rolled, forward_hat))
+    rolled_norm = np.linalg.norm(rolled)
+    if rolled_norm < 1e-8:
+        up_norm = np.linalg.norm(up)
+        if up_norm == 0:
+            return eye, up
+        return eye, up / up_norm
+    return eye, rolled / rolled_norm
+
+
+def fly_distance(scene_diagonal: float, sign: int) -> float:
+    """World-unit step for one Up/Down press. ``sign`` is +1 forward."""
+    return float(sign) * FLY_STEP_FRACTION * float(scene_diagonal)
+
+
+def fly_camera(
+    eye: np.ndarray,
+    center: np.ndarray,
+    distance: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Translate the eye and the look-at point together along the view.
+
+    Positive ``distance`` moves toward the look-at point (forward). The
+    distance between them does not change. A zero-length view is left as-is.
+    """
+    eye = np.asarray(eye, dtype=np.float64)
+    center = np.asarray(center, dtype=np.float64)
+    direction = center - eye
+    norm = np.linalg.norm(direction)
+    if norm < 1e-8:
+        return eye.copy(), center.copy()
+    step = direction / norm * float(distance)
+    return eye + step, center + step
 
 
 def project_points(
@@ -370,10 +440,11 @@ def frame_caption(
 def load_overlay(output_dir: Path, payload: dict | None = None) -> OverlayData:
     """Load poses from cameras.json and points from the matching sparse model.
 
-    ``cameras.json`` may store a Windows path from the machine that ran the
-    reconstruction. The folder name (``sparse/3``) is resolved inside this
-    output directory when that absolute path is not here. Extra COLMAP 4
-    files such as ``frames.bin`` and ``rigs.bin`` are ignored.
+    ``cameras.json`` may store an absolute path from the machine that ran
+    the reconstruction. ``<output>/sparse/<folder name>`` is used when that
+    folder exists, so a moved output directory still opens the right model.
+    The stored absolute path is the fallback. Extra COLMAP 4 files such as
+    ``frames.bin`` and ``rigs.bin`` are ignored.
     """
     output_dir = Path(output_dir)
     if payload is None:
@@ -397,12 +468,22 @@ def load_overlay(output_dir: Path, payload: dict | None = None) -> OverlayData:
 
 
 def resolve_sparse_dir(output_dir: Path, sparse_model: str | None) -> Path | None:
-    """Find the sparse model named in cameras.json, even if the drive letter differs."""
+    """Find the sparse model named in cameras.json.
+
+    A moved reconstruction still has ``<output>/sparse/<folder name>``. That
+    local folder wins over the absolute path stored in cameras.json, which is
+    only used when the local folder is not a model. The folder name is the
+    last path segment, so a Windows path still matches on any platform.
+    """
     output_dir = Path(output_dir)
     named = _folder_name(sparse_model) if sparse_model else ""
+    if named:
+        local = output_dir / "sparse" / named
+        if _is_model_dir(local):
+            return local
     if sparse_model:
         raw = Path(sparse_model)
-        for candidate in (raw, output_dir / raw, output_dir / "sparse" / named):
+        for candidate in (raw, output_dir / raw):
             if _is_model_dir(candidate):
                 return candidate
     models = list_model_dirs(output_dir / "sparse")

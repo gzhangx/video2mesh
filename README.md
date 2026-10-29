@@ -112,15 +112,17 @@ The same key list is printed in the terminal when the window opens:
 | --- | --- |
 | W / S | Pitch up / down around the look-at point. A held key repeats. |
 | A / D | Yaw left / right around the look-at point. |
-| Q / E | Zoom in / out. |
+| Z / C | Roll clockwise / counter-clockwise around the view direction. Same step as pitch and yaw; a held key repeats. |
+| Q / E | Zoom in / out. The eye moves and the look-at point stays. |
+| Up / Down | Dolly forward / backward along the view. The eye and the look-at point move together, by a step proportional to the scene size. |
 | R | Reset the view. |
 | Left / Right, N / P, [ / ] | Previous / next registered frame. |
 | F | Show that frame's photo as a textured plane in its frustum. |
 | H | Hide or show the projected points. |
-| C | Color points by their RGB or by depth. |
+| V | Color points by their RGB or by depth. |
 | G | Switch the overlay between sparse points and `pointcloud.ply`. |
 
-Mouse left-drag still orbits, right-drag pans, and the wheel zooms. The side panel draws `out/frames/<filename>` and projects points with that frame's pose and intrinsics, distortion included. `out/dense/images` are undistorted, so they are not used for this check. Sparse points come from the model named in `cameras.json` (for example `sparse/3`); a Windows path recorded on another drive is matched by the folder name. Extra COLMAP 4 files (`frames.bin`, `rigs.bin`, and the text copies) are ignored.
+Mouse left-drag still orbits, right-drag pans, and the wheel zooms. The side panel draws `out/frames/<filename>` and projects points with that frame's pose and intrinsics, distortion included. `out/dense/images` are undistorted, so they are not used for this check. Sparse points come from the model named in `cameras.json`. The viewer prefers `<output>/sparse/<folder name>` when that folder exists, so a moved output directory still opens the right model, and falls back to the absolute path in the file. Extra COLMAP 4 files (`frames.bin`, `rigs.bin`, and the text copies) are ignored.
 
 ## What you get
 
