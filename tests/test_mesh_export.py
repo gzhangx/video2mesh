@@ -10,6 +10,7 @@ from video2mesh.colmap_io import Camera, FramePose, Point3D, Reconstruction
 from video2mesh.export import write_cameras
 from video2mesh.frames import ExtractedFrame
 from video2mesh.mesh import orient_and_mesh
+from video2mesh.viewmath import image_plane_corners
 from video2mesh.viewer import frustum_lines, load_scene
 
 
@@ -112,6 +113,7 @@ def test_frustum_and_viewer_scene(tmp_path: Path):
     assert len(lines.points) == 5
     assert len(lines.lines) == 8
     np.testing.assert_allclose(np.asarray(lines.points)[0], [0, 0, -2])
+    np.testing.assert_allclose(np.asarray(lines.points)[1:], image_plane_corners(frame, 0.5))
 
     cloud = _sphere_cloud(80)
     assert o3d.io.write_point_cloud(str(tmp_path / "pointcloud.ply"), cloud)

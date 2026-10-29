@@ -117,12 +117,12 @@ The same key list is printed in the terminal when the window opens:
 | Up / Down | Dolly forward / backward along the view. The eye and the look-at point move together, by a step proportional to the scene size. |
 | R | Reset the view. |
 | Left / Right, N / P, [ / ] | Previous / next registered frame. |
-| F | Show that frame's photo as a textured plane in its frustum. |
+| F, or Show image | Draw that frame's photo on its image plane, just behind the scene, and look through the camera so the picture lines up with the mesh. Changing frame while it is on looks through the new camera. |
 | H | Hide or show the projected points. |
 | V | Color points by their RGB or by depth. |
 | G | Switch the overlay between sparse points and `pointcloud.ply`. |
 
-Mouse left-drag still orbits, right-drag pans, and the wheel zooms. The side panel draws `out/frames/<filename>` and projects points with that frame's pose and intrinsics, distortion included. `out/dense/images` are undistorted, so they are not used for this check. Sparse points come from the model named in `cameras.json`. The viewer prefers `<output>/sparse/<folder name>` when that folder exists, so a moved output directory still opens the right model, and falls back to the absolute path in the file. Extra COLMAP 4 files (`frames.bin`, `rigs.bin`, and the text copies) are ignored.
+Mouse left-drag still orbits, right-drag pans, and the wheel zooms. Show image is the checkbox at the top of the side panel. The side panel draws `out/frames/<filename>` and projects points with that frame's pose and intrinsics, distortion included. `out/dense/images` are undistorted, so they are not used for this check. Sparse points come from the model named in `cameras.json`. The viewer prefers `<output>/sparse/<folder name>` when that folder exists, so a moved output directory still opens the right model, and falls back to the absolute path in the file. Extra COLMAP 4 files (`frames.bin`, `rigs.bin`, and the text copies) are ignored.
 
 ## What you get
 

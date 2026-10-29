@@ -16,18 +16,24 @@ from video2mesh.viewmath import (
     VIEW_HELP,
     OverlayData,
     ViewState,
+    KeyEffect,
     apply_key_effect,
+    background_plane_depth,
+    camera_view_pose,
     dolly_camera,
     fit_display,
     fly_camera,
     fly_distance,
     frame_caption,
+    image_plane_corners,
     image_plane_mesh,
     interpret_key,
     key_token,
     load_frame_bgr,
     load_overlay,
+    look_distance,
     orbit_camera,
+    pinhole_matrix,
     pose_from_model,
     roll_camera,
     project_points,
@@ -121,29 +127,13 @@ def view_reconstruction(
 
 
 def frustum_lines(frame: dict, *, scale: float, color: tuple[float, float, float]) -> o3d.geometry.LineSet:
-    """Camera pyramid from the center through the four image corners at ``scale`` depth."""
-    intrinsics = frame["intrinsics"]
-    fx = float(intrinsics.get("fx", intrinsics.get("f")))
-    fy = float(intrinsics.get("fy", fx))
-    cx = float(intrinsics["cx"])
-    cy = float(intrinsics["cy"])
-    width = float(frame["width"])
-    height = float(frame["height"])
-    rotation = _rotation_from_frame(frame)
-    center = np.asarray(frame["camera_center_world"], dtype=np.float64)
+    """Camera pyramid from the center to the four corners of the image plane.
 
-    pixels = np.array(
-        [[0.0, 0.0], [width, 0.0], [width, height], [0.0, height]],
-        dtype=np.float64,
-    )
-    corners_cam = []
-    for u, v in pixels:
-        direction = np.array([(u - cx) / fx, (v - cy) / fy, 1.0], dtype=np.float64)
-        direction = direction / np.linalg.norm(direction) * scale
-        corners_cam.append(direction)
-    corners_cam_arr = np.stack(corners_cam)
-    # X_cam = R X_world + t, and C = -R^T t, so X_world = R^T X_cam + C.
-    corners_world = (rotation.T @ corners_cam_arr.T).T + center
+    The far face is the flat sensor rectangle at depth ``scale``, the same
+    quad the frame photo is drawn on.
+    """
+    center = np.asarray(frame["camera_center_world"], dtype=np.float64)
+    corners_world = image_plane_corners(frame, scale)
     points = np.vstack([center.reshape(1, 3), corners_world])
     lines = np.array(
         [
@@ -163,15 +153,6 @@ def frustum_lines(frame: dict, *, scale: float, color: tuple[float, float, float
     line_set.lines = o3d.utility.Vector2iVector(lines)
     line_set.colors = o3d.utility.Vector3dVector(np.tile(np.asarray(color), (len(lines), 1)))
     return line_set
-
-
-def _rotation_from_frame(frame: dict) -> np.ndarray:
-    matrix = np.asarray(frame["world_to_camera"], dtype=np.float64)
-    if matrix.shape == (3, 4):
-        return matrix[:, :3]
-    from video2mesh.colmap_io import qvec_to_rotmat
-
-    return qvec_to_rotmat(np.asarray(frame["rotation_quaternion_wxyz"], dtype=np.float64))
 
 
 def _auto_scale(bounds: np.ndarray, frames: list[dict]) -> float:
@@ -217,6 +198,7 @@ class _ReconstructionWindow:
         self.state = state
         self._panel_width = 480
         self._bgr_cache: dict[int, tuple[np.ndarray, bool]] = {}
+        self._checkbox_guard = False
 
     def run(self) -> None:
         import open3d.visualization.gui as gui
@@ -233,6 +215,12 @@ class _ReconstructionWindow:
         self.scene.set_view_controls(gui.SceneWidget.Controls.ROTATE_CAMERA)
         self.label = gui.Label(" ")
         self.label.text_color = gui.Color(1, 1, 1)
+        self.show_image = gui.Checkbox("Show image")
+        self.show_image.checked = self.state.show_photo
+        self.show_image.tooltip = (
+            "Draw this frame's photo on its image plane and look through the camera"
+        )
+        self.show_image.set_on_checked(self._on_show_image)
         self.image = gui.ImageWidget()
         self._lit = rendering.MaterialRecord()
         self._lit.shader = "defaultLit"
@@ -244,6 +232,8 @@ class _ReconstructionWindow:
         self._lines.line_width = 2.0
         self._lines.base_color = [1.0, 1.0, 1.0, 1.0]
         self._photo_mat = rendering.MaterialRecord()
+        # Open3D 0.20's defaultUnlitTransparency shader has no srgbColor uniform,
+        # and the renderer always sets one, which aborts the frame.
         self._photo_mat.shader = "defaultUnlit"
         self._photo_mat.base_color = [1.0, 1.0, 1.0, 1.0]
         model = self.geometries[0]
@@ -263,6 +253,7 @@ class _ReconstructionWindow:
         self._reset_center = center.astype(np.float32)
         self.scene.setup_camera(60.0, box, self._reset_center)
         self.window.add_child(self.scene)
+        self.window.add_child(self.show_image)
         self.window.add_child(self.label)
         self.window.add_child(self.image)
         self.window.set_on_layout(self._on_layout)
@@ -274,9 +265,15 @@ class _ReconstructionWindow:
         gui = self._gui
         rect = self.window.content_rect
         panel = max(280, min(520, rect.width // 3))
+        em = int(self.window.theme.font_size)
+        check_h = em + 12
+        label_h = max(64, em * 3)
+        x = rect.get_right() - panel
         self.scene.frame = gui.Rect(rect.x, rect.y, max(1, rect.width - panel), rect.height)
-        self.label.frame = gui.Rect(rect.get_right() - panel, rect.y, panel, 64)
-        self.image.frame = gui.Rect(rect.get_right() - panel, rect.y + 64, panel, max(1, rect.height - 64))
+        self.show_image.frame = gui.Rect(x + 8, rect.y + 4, max(1, panel - 8), check_h)
+        self.label.frame = gui.Rect(x + 8, rect.y + 4 + check_h, max(1, panel - 16), label_h)
+        image_top = 4 + check_h + label_h
+        self.image.frame = gui.Rect(x, rect.y + image_top, panel, max(1, rect.height - image_top))
         if abs(panel - self._panel_width) > 8:
             self._panel_width = panel
             self._refresh_overlay()
@@ -322,12 +319,58 @@ class _ReconstructionWindow:
         if overlay_changed:
             previous = self.state.frame_index
             self.state = apply_key_effect(self.state, effect, len(self.overlay.frames))
-            if self.state.frame_index != previous:
-                self._put_frustum(previous, selected=False)
-                self._put_frustum(self.state.frame_index, selected=True)
-            self._refresh_overlay()
+            turned_on = effect.toggle_photo and self.state.show_photo
+            frame_moved = self.state.frame_index != previous
+            self._commit_overlay(previous, aim=self.state.show_photo and (turned_on or frame_moved))
         self.window.post_redraw()
         return True
+
+    def _on_show_image(self, checked: bool) -> None:
+        if self._checkbox_guard or checked == self.state.show_photo:
+            return
+        previous = self.state.frame_index
+        self.state = apply_key_effect(
+            self.state,
+            KeyEffect(toggle_photo=True),
+            len(self.overlay.frames),
+        )
+        self._commit_overlay(previous, aim=self.state.show_photo)
+        self.window.post_redraw()
+
+    def _commit_overlay(self, previous: int, *, aim: bool) -> None:
+        if self.state.frame_index != previous:
+            self._put_frustum(previous, selected=False)
+            self._put_frustum(self.state.frame_index, selected=True)
+        self._sync_show_image()
+        self._refresh_overlay()
+        if aim:
+            self._look_through_current_frame()
+
+    def _sync_show_image(self) -> None:
+        self._checkbox_guard = True
+        try:
+            self.show_image.checked = self.state.show_photo
+        finally:
+            self._checkbox_guard = False
+
+    def _look_through_current_frame(self) -> None:
+        """Match the viewport to this frame, so the photo fills the camera frame."""
+        frame = self.overlay.frames[self.state.frame_index]
+        extent = float(np.linalg.norm(np.asarray(self._reset_bounds.get_extent(), dtype=np.float64)))
+        minimum = max(extent * 0.35, self.scale * 4.0, 1e-2)
+        target = np.asarray(self._reset_center, dtype=np.float64)
+        distance = look_distance(frame, target, minimum)
+        eye, look, up = camera_view_pose(frame, distance)
+        look32 = look.astype(np.float32)
+        self.scene.look_at(look32, eye.astype(np.float32), up.astype(np.float32))
+        # look_at leaves the orbit pivot where it was.
+        self.scene.center_of_rotation = look32
+        near = min(max(self.scale * 0.02, 1e-4), self.scale * 0.25)
+        plane = self._photo_depth(frame)
+        far = max(extent * 20.0, distance * 8.0, plane * 3.0, self.scale * 20.0, near * 1000.0)
+        matrix, width, height = pinhole_matrix(frame)
+        # Intrinsics map the image rectangle onto the view, principal point included.
+        self.scene.scene.camera.set_projection(matrix, near, far, width, height)
 
     def _pose(self):
         eye, _forward, up = pose_from_model(self.scene.scene.camera.get_model_matrix())
@@ -385,11 +428,14 @@ class _ReconstructionWindow:
                 scene.show_geometry(name, False)
             return
         rgb = cv2_rgb(bgr)
-        mesh = image_plane_mesh(frame, rgb, self.scale)
+        mesh = image_plane_mesh(frame, rgb, self._photo_depth(frame))
         if scene.has_geometry(name):
             scene.remove_geometry(name)
         self._photo_mat.albedo_img = o3d.geometry.Image(np.ascontiguousarray(rgb))
         scene.add_geometry(name, mesh, self._photo_mat)
+
+    def _photo_depth(self, frame: dict) -> float:
+        return background_plane_depth(frame, _box_corners(self._reset_bounds), self.scale)
 
     def _put_frustum(self, index: int, *, selected: bool) -> None:
         frame = self.overlay.frames[index]
@@ -399,6 +445,18 @@ class _ReconstructionWindow:
         if self.scene.scene.has_geometry(name):
             self.scene.scene.remove_geometry(name)
         self.scene.scene.add_geometry(name, lines, self._lines)
+
+
+def _box_corners(box: o3d.geometry.AxisAlignedBoundingBox) -> np.ndarray:
+    low = np.asarray(box.get_min_bound(), dtype=np.float64)
+    high = np.asarray(box.get_max_bound(), dtype=np.float64)
+    xs, ys, zs = np.meshgrid(
+        (low[0], high[0]),
+        (low[1], high[1]),
+        (low[2], high[2]),
+        indexing="ij",
+    )
+    return np.stack((xs.ravel(), ys.ravel(), zs.ravel()), axis=1)
 
 
 def cv2_rgb(image_bgr: np.ndarray) -> np.ndarray:

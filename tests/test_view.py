@@ -16,6 +16,8 @@ from video2mesh.viewmath import (
     KeyEffect,
     ViewState,
     apply_key_effect,
+    background_plane_depth,
+    camera_view_pose,
     dolly_camera,
     fly_camera,
     fly_distance,
@@ -23,6 +25,9 @@ from video2mesh.viewmath import (
     image_plane_mesh,
     interpret_key,
     key_token,
+    look_distance,
+    pinhole_matrix,
+    vertical_fov_degrees,
     load_overlay,
     orbit_camera,
     pose_from_model,
@@ -125,7 +130,35 @@ def test_image_plane_is_the_sensor_rectangle():
     mesh = image_plane_mesh(frame, rgb, depth=2.0)
     assert len(mesh.triangles) == 4
     assert len(mesh.triangle_uvs) == 12
-    np.testing.assert_allclose(np.asarray(mesh.vertices)[0], [-1.0, -1.0, 2.0])
+    verts = np.asarray(mesh.vertices)
+    np.testing.assert_allclose(verts[0], [-1.0, -1.0, 2.0])
+    # The scene-facing copy is a sliver further along the optical axis.
+    np.testing.assert_allclose(verts[4] - verts[0], [0.0, 0.0, 0.002])
+
+
+def test_camera_view_looks_through_the_frame_upright():
+    eye, look, up = camera_view_pose(_frame(), distance=3.0)
+    np.testing.assert_allclose(eye, [0.0, 0.0, 0.0])
+    np.testing.assert_allclose(look, [0.0, 0.0, 3.0])
+    # OpenCV Y is down, so image-up is camera -Y.
+    np.testing.assert_allclose(up, [0.0, -1.0, 0.0])
+    # height 80, fy 50 -> 2 * atan(0.8)
+    assert vertical_fov_degrees(_frame()) == pytest.approx(np.rad2deg(2.0 * np.arctan(0.8)))
+    matrix, width, height = pinhole_matrix(_frame())
+    assert (width, height) == (100.0, 80.0)
+    np.testing.assert_allclose(matrix, [[50.0, 0.0, 50.0], [0.0, 50.0, 40.0], [0.0, 0.0, 1.0]])
+
+    shifted = _frame(camera_center_world=[1.0, 2.0, 3.0])
+    eye, look, up = camera_view_pose(shifted, distance=4.0)
+    np.testing.assert_allclose(eye, [1.0, 2.0, 3.0])
+    np.testing.assert_allclose(look, [1.0, 2.0, 7.0])
+    np.testing.assert_allclose(up, [0.0, -1.0, 0.0])
+    # A point ahead of the camera is used; a point behind falls back.
+    assert look_distance(_frame(), np.array([0.0, 0.0, 5.0]), minimum=1.0) == pytest.approx(5.0)
+    assert look_distance(_frame(), np.array([0.0, 0.0, -2.0]), minimum=1.5) == pytest.approx(1.5)
+    points = np.array([[0.0, 0.0, 2.0], [0.0, 0.0, 5.0], [0.0, 0.0, -1.0]])
+    assert background_plane_depth(_frame(), points, minimum=0.2) == pytest.approx(5.1)
+    assert background_plane_depth(_frame(), np.zeros((0, 3)), minimum=0.4) == pytest.approx(0.4)
 
 
 def test_orbit_yaw_pitch_zoom_and_pose_matrix():

@@ -31,11 +31,15 @@ Keys (held keys repeat):
   Up / Down   dolly forward / backward along the view (eye and look-at move together)
   R           reset the view
   Left / Right, N / P, or [ / ]    previous / next frame
-  F           show this frame's photo as a plane in its frustum
+  F           show this frame's image on its camera plane and look through it
   H           hide or show the projected points
   V           color those points by RGB or by depth
   G           use sparse points or pointcloud.ply
 Mouse: left-drag orbits, right-drag pans, wheel zooms.
+The Show image checkbox does the same thing as F. The photo is drawn on that
+camera's image plane, just behind the scene, and the view moves to that camera
+so the picture lines up with the mesh. Changing frame while it is on looks
+through the new camera.
 
 The side panel shows the original frame from out/frames. Points are projected
 with that frame's pose and intrinsics, including lens distortion. Images in
@@ -370,21 +374,95 @@ def image_plane_corners(frame: dict, depth: float) -> np.ndarray:
 
 
 def image_plane_mesh(frame: dict, rgb: np.ndarray, depth: float) -> o3d.geometry.TriangleMesh:
-    """Textured quad, drawn from both sides, sitting on the image plane."""
+    """Textured quad on the image plane, visible from the camera and the scene.
+
+    The two sides sit a sliver apart along the optical axis so a transparent
+    photo does not z-fight with itself. Vertices 0..3 face the camera.
+    """
     corners = image_plane_corners(frame, depth)
-    vertices = o3d.utility.Vector3dVector(corners)
-    # Two windings so the photo is visible from the camera and from behind.
-    triangles = np.array([[0, 1, 2], [0, 2, 3], [0, 2, 1], [0, 3, 2]], dtype=np.int32)
+    rotation, _center = _camera_pose(frame)
+    forward = rotation.T @ np.array([0.0, 0.0, 1.0])
+    gap = max(abs(float(depth)) * 1e-3, 1e-6)
+    far = corners + forward * gap
     mesh = o3d.geometry.TriangleMesh()
-    mesh.vertices = vertices
+    mesh.vertices = o3d.utility.Vector3dVector(np.vstack([corners, far]))
+    # 0..3 is CCW when looking along the optical axis. 4..7 faces the scene.
+    triangles = np.array([[0, 2, 1], [0, 3, 2], [4, 5, 6], [4, 6, 7]], dtype=np.int32)
     mesh.triangles = o3d.utility.Vector3iVector(triangles)
     tl, tr, br, bl = (0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)
-    uvs = [tl, tr, br, tl, br, bl, tl, br, tr, tl, bl, br]
+    uvs = [tl, br, tr, tl, bl, br, tl, tr, br, tl, br, bl]
     mesh.triangle_uvs = o3d.utility.Vector2dVector(np.asarray(uvs, dtype=np.float64))
     mesh.triangle_material_ids = o3d.utility.IntVector([0, 0, 0, 0])
     texture = np.ascontiguousarray(_fit_rgb(rgb, 1024))
     mesh.textures = [o3d.geometry.Image(texture)]
     return mesh
+
+
+def vertical_fov_degrees(frame: dict) -> float:
+    """Vertical field of view, in degrees, from the frame's pinhole intrinsics."""
+    _fx, fy, _cx, _cy, _width, height = _scaled_intrinsics(frame, None)
+    if fy <= 1e-8 or height <= 0:
+        return 60.0
+    return float(np.rad2deg(2.0 * np.arctan(height / (2.0 * fy))))
+
+
+def pinhole_matrix(frame: dict) -> tuple[np.ndarray, float, float]:
+    """OpenCV intrinsics ``K`` plus the calibrated width and height.
+
+    Distortion is not included. The viewer uses this matrix so the viewport
+    matches the image plane: pixel (0, 0) is the top-left of the view.
+    """
+    fx, fy, cx, cy, width, height = _scaled_intrinsics(frame, None)
+    matrix = np.array(
+        [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+    return matrix, float(width), float(height)
+
+
+def camera_view_pose(
+    frame: dict,
+    distance: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Eye, look-at, and up that look through this frame's camera.
+
+    COLMAP cameras look along +Z with Y down. The returned up is the image
+    up direction (camera -Y in world), so the photo is upright in the view.
+    ``distance`` is how far ahead of the camera the look-at point sits.
+    """
+    rotation, center = _camera_pose(frame)
+    forward = rotation.T @ np.array([0.0, 0.0, 1.0])
+    up = rotation.T @ np.array([0.0, -1.0, 0.0])
+    ahead = max(float(distance), 1e-3)
+    return center.copy(), center + forward * ahead, up
+
+
+def look_distance(frame: dict, point: np.ndarray, minimum: float) -> float:
+    """Distance along the optical axis to ``point``, or ``minimum`` if it is behind."""
+    rotation, center = _camera_pose(frame)
+    depth = float((rotation @ (np.asarray(point, dtype=np.float64) - center))[2])
+    if not np.isfinite(depth) or depth < float(minimum):
+        return float(minimum)
+    return depth
+
+
+def background_plane_depth(frame: dict, points: np.ndarray, minimum: float) -> float:
+    """Depth just past the furthest point in front of the camera.
+
+    The photo is drawn there, so the mesh stays in front of an opaque image.
+    ``minimum`` is used when nothing lies ahead of the camera.
+    """
+    floor = float(minimum)
+    points = np.asarray(points, dtype=np.float64)
+    if points.size == 0:
+        return floor
+    rotation, center = _camera_pose(frame)
+    depth = (rotation @ (points.reshape(-1, 3) - center).T).T[:, 2]
+    ahead = depth[np.isfinite(depth) & (depth > 1e-4)]
+    if ahead.size == 0:
+        return floor
+    far = float(np.max(ahead))
+    return max(far + max(far * 0.02, 1e-3), floor)
 
 
 def render_overlay(
@@ -430,7 +508,7 @@ def frame_caption(
     else:
         source = "sparse points" if state.point_source == "sparse" else "pointcloud.ply"
         points = f"{visible} points  {state.color_mode}  {source}"
-    photo = "photo on" if state.show_photo else "photo off"
+    photo = "image on" if state.show_photo else "image off"
     missing = "" if image_found else "  (frame image missing)"
     note = _model_note(str(frame.get("camera_model", "")))
     extra = f"  {note}" if note else ""
