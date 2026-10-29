@@ -38,10 +38,12 @@ Keys (held keys repeat):
 Mouse: left-drag orbits, right-drag pans, wheel zooms.
 The Show image checkbox does the same thing as F. The photo is drawn on that
 camera's image plane, just behind the scene, and the mesh is drawn transparent
-so the picture shows through. Only that camera's frustum stays visible. The
-Mesh alpha slider changes how solid the mesh is. The view moves to that camera.
-Rotate 180 turns the photo half a turn. Changing frame while the image is on
-looks through the new camera.
+so the picture shows through. The photo is undistorted onto that camera's
+pinhole plane, so the mesh and the COLMAP points land on the same pixels.
+Only that camera's frustum stays visible. Feature points draws the sparse
+COLMAP points. The Mesh alpha slider changes how solid the mesh is. The view
+moves to that camera. Changing frame while the image is on looks through the
+new camera.
 
 The side panel shows the original frame from out/frames. Points are projected
 with that frame's pose and intrinsics, including lens distortion. Images in
@@ -391,7 +393,10 @@ def image_plane_mesh(frame: dict, rgb: np.ndarray, depth: float) -> o3d.geometry
     # 0..3 is CCW when looking along the optical axis. 4..7 faces the scene.
     triangles = np.array([[0, 2, 1], [0, 3, 2], [4, 5, 6], [4, 6, 7]], dtype=np.int32)
     mesh.triangles = o3d.utility.Vector3iVector(triangles)
-    tl, tr, br, bl = (0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)
+    # Filament treats v=0 as the bottom of the bitmap. Pixel (0, 0) is the
+    # top of the photo, so the top edge uses v=1. A 180 degree turn would
+    # also swap left and right, and the points would miss the photo.
+    tl, tr, br, bl = (0.0, 1.0), (1.0, 1.0), (1.0, 0.0), (0.0, 0.0)
     uvs = [tl, br, tr, tl, bl, br, tl, tr, br, tl, br, bl]
     mesh.triangle_uvs = o3d.utility.Vector2dVector(np.asarray(uvs, dtype=np.float64))
     mesh.triangle_material_ids = o3d.utility.IntVector([0, 0, 0, 0])
@@ -470,6 +475,41 @@ def background_plane_depth(frame: dict, points: np.ndarray, minimum: float) -> f
 def frustum_visible(index: int, current: int, image_mode: bool) -> bool:
     """Other camera markers are hidden while a frame photo is shown."""
     return (not image_mode) or index == current
+
+
+def undistort_bgr(image_bgr: np.ndarray, frame: dict) -> np.ndarray:
+    """Remove lens distortion so the photo matches a pinhole view of the mesh.
+
+    The 3D camera uses ``K`` without distortion. A distorted bitmap would put
+    scene points on the wrong pixels. Pinhole frames are returned unchanged.
+    """
+    model = str(frame.get("camera_model", "PINHOLE")).upper()
+    if model in {"", "SIMPLE_PINHOLE", "PINHOLE"}:
+        return image_bgr
+    height, width = image_bgr.shape[:2]
+    fx, fy, cx, cy, _w, _h = _scaled_intrinsics(frame, (width, height))
+    matrix = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64)
+    intr = frame.get("intrinsics") or {}
+    k1 = float(intr.get("k1", 0.0))
+    k2 = float(intr.get("k2", 0.0))
+    p1 = float(intr.get("p1", 0.0))
+    p2 = float(intr.get("p2", 0.0))
+    if model == "SIMPLE_RADIAL":
+        dist = np.array([k1, 0.0, 0.0, 0.0], dtype=np.float64)
+    elif model == "RADIAL":
+        dist = np.array([k1, k2, 0.0, 0.0], dtype=np.float64)
+    elif model == "OPENCV":
+        dist = np.array([k1, k2, p1, p2], dtype=np.float64)
+    elif model == "FULL_OPENCV":
+        dist = np.array(
+            [k1, k2, p1, p2, float(intr.get("k3", 0.0)), float(intr.get("k4", 0.0)), float(intr.get("k5", 0.0)), float(intr.get("k6", 0.0))],
+            dtype=np.float64,
+        )
+    else:
+        return image_bgr
+    if not np.any(dist):
+        return image_bgr
+    return cv2.undistort(image_bgr, matrix, dist)
 
 
 def half_turn(image: np.ndarray) -> np.ndarray:

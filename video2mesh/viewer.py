@@ -26,8 +26,8 @@ from video2mesh.viewmath import (
     fly_distance,
     frame_caption,
     frustum_visible,
-    half_turn,
     image_plane_corners,
+    undistort_bgr,
     image_plane_mesh,
     interpret_key,
     key_token,
@@ -201,7 +201,7 @@ class _ReconstructionWindow:
         self._panel_width = 480
         self._bgr_cache: dict[int, tuple[np.ndarray, bool]] = {}
         self._checkbox_guard = False
-        self.flip_upright = False
+        self.show_features = False
         self.mesh_alpha = 0.35
 
     def run(self) -> None:
@@ -225,10 +225,11 @@ class _ReconstructionWindow:
             "Draw this frame's photo on its image plane and look through the camera"
         )
         self.show_image.set_on_checked(self._on_show_image)
-        self.flip_image = gui.Checkbox("Rotate 180")
-        self.flip_image.checked = self.flip_upright
-        self.flip_image.tooltip = "Turn the photo upright by rotating it 180 degrees"
-        self.flip_image.set_on_checked(self._on_flip_image)
+        self.features = gui.Checkbox("Feature points")
+        self.features.checked = False
+        self.features.enabled = len(self.overlay.sparse_xyz) > 0
+        self.features.tooltip = "Show the COLMAP sparse points so they can be checked against the photo"
+        self.features.set_on_checked(self._on_features)
         self.alpha_label = gui.Label(self._alpha_caption())
         self.alpha_label.text_color = gui.Color(1, 1, 1)
         self.alpha_slider = gui.Slider(gui.Slider.Type.DOUBLE)
@@ -257,9 +258,14 @@ class _ReconstructionWindow:
         # and the renderer always sets one, which aborts the frame.
         self._photo_mat.shader = "defaultUnlit"
         self._photo_mat.base_color = [1.0, 1.0, 1.0, 1.0]
+        self._feature_mat = rendering.MaterialRecord()
+        self._feature_mat.shader = "defaultUnlit"
+        self._feature_mat.point_size = 5.0
+        self._feature_mat.base_color = [1.0, 1.0, 1.0, 1.0]
         model = self.geometries[0]
         material = self._points if isinstance(model, o3d.geometry.PointCloud) else self._lit
         self.scene.scene.add_geometry("model", model, material)
+        self._add_feature_points()
         for index, frame in enumerate(self.overlay.frames):
             self._put_frustum(index, selected=index == self.state.frame_index)
         bounds = _bounds_from_scene(self.geometries, self.overlay.frames)
@@ -275,7 +281,7 @@ class _ReconstructionWindow:
         self.scene.setup_camera(60.0, box, self._reset_center)
         self.window.add_child(self.scene)
         self.window.add_child(self.show_image)
-        self.window.add_child(self.flip_image)
+        self.window.add_child(self.features)
         self.window.add_child(self.alpha_label)
         self.window.add_child(self.alpha_slider)
         self.window.add_child(self.label)
@@ -294,7 +300,7 @@ class _ReconstructionWindow:
         label_h = max(64, em * 3)
         x = rect.get_right() - panel
         self.scene.frame = gui.Rect(rect.x, rect.y, max(1, rect.width - panel), rect.height)
-        controls = (self.show_image, self.flip_image, self.alpha_label, self.alpha_slider)
+        controls = (self.show_image, self.features, self.alpha_label, self.alpha_slider)
         for row, widget in enumerate(controls):
             widget.frame = gui.Rect(x + 8, rect.y + 4 + row * check_h, max(1, panel - 16), check_h)
         text_top = 4 + len(controls) * check_h
@@ -364,9 +370,10 @@ class _ReconstructionWindow:
         self._commit_overlay(previous, aim=self.state.show_photo)
         self.window.post_redraw()
 
-    def _on_flip_image(self, checked: bool) -> None:
-        self.flip_upright = bool(checked)
-        self._refresh_overlay()
+    def _on_features(self, checked: bool) -> None:
+        self.show_features = bool(checked)
+        if self.scene.scene.has_geometry("features"):
+            self.scene.scene.show_geometry("features", self.show_features)
         self.window.post_redraw()
 
     def _on_mesh_alpha(self, value: float) -> None:
@@ -473,9 +480,7 @@ class _ReconstructionWindow:
                 scene.show_geometry(name, False)
             return
         self._apply_model_opacity()
-        rgb = cv2_rgb(bgr)
-        if self.flip_upright:
-            rgb = half_turn(rgb)
+        rgb = cv2_rgb(undistort_bgr(bgr, frame))
         mesh = image_plane_mesh(frame, rgb, self._photo_depth(frame))
         if scene.has_geometry(name):
             scene.remove_geometry(name)
@@ -493,6 +498,18 @@ class _ReconstructionWindow:
             material = self._lit
         if self.scene.scene.has_geometry("model"):
             self.scene.scene.modify_geometry_material("model", material)
+
+    def _add_feature_points(self) -> None:
+        xyz = self.overlay.sparse_xyz
+        if len(xyz) == 0:
+            return
+        cloud = o3d.geometry.PointCloud()
+        cloud.points = o3d.utility.Vector3dVector(xyz)
+        rgb = np.asarray(self.overlay.sparse_rgb, dtype=np.float64)
+        if len(rgb) == len(xyz):
+            cloud.colors = o3d.utility.Vector3dVector(np.clip(rgb, 0.0, 1.0))
+        self.scene.scene.add_geometry("features", cloud, self._feature_mat)
+        self.scene.scene.show_geometry("features", False)
 
     def _photo_depth(self, frame: dict) -> float:
         return background_plane_depth(frame, _box_corners(self._reset_bounds), self.scale)

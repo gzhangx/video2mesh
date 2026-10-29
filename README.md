@@ -117,12 +117,12 @@ The same key list is printed in the terminal when the window opens:
 | Up / Down | Dolly forward / backward along the view. The eye and the look-at point move together, by a step proportional to the scene size. |
 | R | Reset the view. |
 | Left / Right, N / P, [ / ] | Previous / next registered frame. |
-| F, or Show image | Draw that frame's photo on its image plane and look through the camera. The mesh turns transparent, and only that camera's frustum stays visible. |
+| F, or Show image | Draw that frame's photo, undistorted, on its camera plane and look through the camera. The mesh turns transparent, and only that camera stays visible. |
 | H | Hide or show the projected points. |
 | V | Color points by their RGB or by depth. |
 | G | Switch the overlay between sparse points and `pointcloud.ply`. |
 
-Mouse left-drag still orbits, right-drag pans, and the wheel zooms. Show image, Rotate 180, and the Mesh alpha slider are at the top of the side panel. Rotate 180 turns the photo half a turn. Mesh alpha changes how solid the mesh is while the photo is showing. In that mode only the current camera frustum stays visible. The side panel draws `out/frames/<filename>` and projects points with that frame's pose and intrinsics, distortion included. `out/dense/images` are undistorted, so they are not used for this check. Sparse points come from the model named in `cameras.json`. The viewer prefers `<output>/sparse/<folder name>` when that folder exists, so a moved output directory still opens the right model, and falls back to the absolute path in the file. Extra COLMAP 4 files (`frames.bin`, `rigs.bin`, and the text copies) are ignored.
+Mouse left-drag still orbits, right-drag pans, and the wheel zooms. Show image, Feature points, and the Mesh alpha slider are at the top of the side panel. Feature points draws the COLMAP sparse points in the scene. The photo in the 3D view is undistorted onto the camera plane, so those points and the mesh line up with it. Mesh alpha changes how solid the mesh is while the photo is showing. In that mode only the current camera frustum stays visible. The side panel draws the original `out/frames/<filename>` and projects points with that frame's pose and intrinsics, distortion included. `out/dense/images` are not used for the side panel. Sparse points come from the model named in `cameras.json`. The viewer prefers `<output>/sparse/<folder name>` when that folder exists, so a moved output directory still opens the right model, and falls back to the absolute path in the file. Extra COLMAP 4 files (`frames.bin`, `rigs.bin`, and the text copies) are ignored.
 
 ## What you get
 

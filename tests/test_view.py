@@ -23,6 +23,7 @@ from video2mesh.viewmath import (
     fly_distance,
     frustum_visible,
     half_turn,
+    undistort_bgr,
     image_plane_corners,
     image_plane_mesh,
     interpret_key,
@@ -134,6 +135,10 @@ def test_image_plane_is_the_sensor_rectangle():
     assert len(mesh.triangle_uvs) == 12
     verts = np.asarray(mesh.vertices)
     np.testing.assert_allclose(verts[0], [-1.0, -1.0, 2.0])
+    # Top-left of the photo samples the top of the bitmap, not a 180 turn.
+    uvs = np.asarray(mesh.triangle_uvs)
+    np.testing.assert_allclose(uvs[0], [0.0, 1.0])
+    np.testing.assert_allclose(uvs[1], [1.0, 0.0])
     # The scene-facing copy is a sliver further along the optical axis.
     np.testing.assert_allclose(verts[4] - verts[0], [0.0, 0.0, 0.002])
 
@@ -169,6 +174,20 @@ def test_image_mode_keeps_only_the_current_frustum():
     assert frustum_visible(1, 1, True)
     assert not frustum_visible(0, 1, True)
     assert not frustum_visible(2, 1, True)
+
+
+def test_undistort_leaves_a_pinhole_bitmap_unchanged():
+    image = np.zeros((8, 10, 3), dtype=np.uint8)
+    image[1, 2] = (9, 8, 7)
+    frame = _frame(width=10, height=8, intrinsics={"f": 8.0, "fx": 8.0, "fy": 8.0, "cx": 5.0, "cy": 4.0})
+    np.testing.assert_array_equal(undistort_bgr(image, frame), image)
+    radial = _frame(
+        width=10,
+        height=8,
+        camera_model="SIMPLE_RADIAL",
+        intrinsics={"f": 8.0, "fx": 8.0, "fy": 8.0, "cx": 5.0, "cy": 4.0, "k1": 0.0},
+    )
+    np.testing.assert_array_equal(undistort_bgr(image, radial), image)
 
 
 def test_half_turn_swaps_opposite_corners():
