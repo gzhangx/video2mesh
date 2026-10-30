@@ -34,6 +34,8 @@ from video2mesh.viewmath import (
     load_frame_bgr,
     load_overlay,
     look_distance,
+    zoom_ratio,
+    zoomed_view_pose,
     marker_axes,
     marker_mesh,
     orbit_camera,
@@ -213,6 +215,7 @@ class _ReconstructionWindow:
         self._axis_guard = False
         self._position: np.ndarray | None = None
         self._marker_kind_shown = ""
+        self._look_span: float | None = None
 
     def run(self) -> None:
         import open3d.visualization.gui as gui
@@ -524,6 +527,7 @@ class _ReconstructionWindow:
         if effect is None:
             return False
         if effect.reset:
+            self._look_span = None
             self.scene.setup_camera(60.0, self._reset_bounds, self._reset_center)
         elif effect.zoom_factor is not None:
             eye, center, up = self._pose()
@@ -560,7 +564,11 @@ class _ReconstructionWindow:
             self.state = apply_key_effect(self.state, effect, len(self.overlay.frames))
             turned_on = effect.toggle_photo and self.state.show_photo
             frame_moved = self.state.frame_index != previous
-            self._commit_overlay(previous, aim=self.state.show_photo and (turned_on or frame_moved))
+            self._commit_overlay(
+                previous,
+                aim=self.state.show_photo and (turned_on or frame_moved),
+                keep_zoom=frame_moved,
+            )
         self.window.post_redraw()
         return True
 
@@ -593,7 +601,7 @@ class _ReconstructionWindow:
     def _alpha_caption(self) -> str:
         return f"Mesh alpha  {self.mesh_alpha:.2f}"
 
-    def _commit_overlay(self, previous: int, *, aim: bool) -> None:
+    def _commit_overlay(self, previous: int, *, aim: bool, keep_zoom: bool = False) -> None:
         if self.state.frame_index != previous:
             self._put_frustum(previous, selected=False)
             self._put_frustum(self.state.frame_index, selected=True)
@@ -601,7 +609,7 @@ class _ReconstructionWindow:
         self._sync_show_image()
         self._refresh_overlay()
         if aim:
-            self._look_through_current_frame()
+            self._look_through_current_frame(keep_zoom=keep_zoom)
 
     def _sync_show_image(self) -> None:
         self._checkbox_guard = True
@@ -610,14 +618,23 @@ class _ReconstructionWindow:
         finally:
             self._checkbox_guard = False
 
-    def _look_through_current_frame(self) -> None:
-        """Match the viewport to this frame, so the photo fills the camera frame."""
+    def _look_through_current_frame(self, *, keep_zoom: bool = False) -> None:
+        """Match the viewport to this frame, so the photo fills the camera frame.
+
+        ``keep_zoom`` carries the current eye distance over to the new frame
+        instead of jumping back to the default view.
+        """
         frame = self.overlay.frames[self.state.frame_index]
         extent = float(np.linalg.norm(np.asarray(self._reset_bounds.get_extent(), dtype=np.float64)))
         minimum = max(extent * 0.35, self.scale * 4.0, 1e-2)
         target = np.asarray(self._reset_center, dtype=np.float64)
         distance = look_distance(frame, target, minimum)
-        _eye, look, _up = camera_view_pose(frame, distance)
+        zoom = 1.0
+        if keep_zoom and self._look_span is not None:
+            eye, center, _up = self._pose()
+            zoom = zoom_ratio(float(np.linalg.norm(eye - center)), self._look_span)
+        self._look_span = distance
+        eye, look, up = zoomed_view_pose(frame, distance, zoom)
         near = min(max(self.scale * 0.02, 1e-4), self.scale * 0.25)
         plane = self._photo_depth(frame)
         far = max(extent * 20.0, distance * 8.0, plane * 3.0, self.scale * 20.0, near * 1000.0)
@@ -632,8 +649,13 @@ class _ReconstructionWindow:
             int(height),
             self._reset_bounds,
         )
+        look32 = look.astype(np.float32)
+        if abs(zoom - 1.0) > 1e-4:
+            # look_at moves the eye to the zoomed distance and replaces the
+            # pinhole projection, so the intrinsics are set again afterward.
+            self.scene.look_at(look32, eye.astype(np.float32), up.astype(np.float32))
         self.scene.scene.camera.set_projection(matrix, near, far, width, height)
-        self.scene.center_of_rotation = look.astype(np.float32)
+        self.scene.center_of_rotation = look32
 
     def _pose(self):
         eye, _forward, up = pose_from_model(self.scene.scene.camera.get_model_matrix())

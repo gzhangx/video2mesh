@@ -43,7 +43,7 @@ pinhole plane, so the mesh and the COLMAP points land on the same pixels.
 Only that camera's frustum stays visible. Feature points draws the sparse
 COLMAP points. The Mesh alpha slider changes how solid the mesh is. The view
 moves to that camera. Changing frame while the image is on looks through the
-new camera. Place, then click the mesh, attaches a cube or sphere to that
+new camera and keeps the current zoom. Place, then click the mesh, attaches a cube or sphere to that
 point. X, Y, and Z slide it along each world axis. Place again to attach it
 somewhere else.
 
@@ -458,6 +458,35 @@ def camera_view_pose(
     up = rotation.T @ np.array([0.0, -1.0, 0.0])
     ahead = max(float(distance), 1e-3)
     return center.copy(), center + forward * ahead, up
+
+
+def zoom_ratio(current_distance: float, reference_distance: float) -> float:
+    """How far the eye sits relative to the last frame view. 1 is the default.
+
+    A smaller ratio is zoomed in. A missing or unusable reference stays at 1.
+    """
+    current = float(current_distance)
+    reference = float(reference_distance)
+    if reference <= 1e-8 or not np.isfinite(current) or current <= 1e-8:
+        return 1.0
+    return current / reference
+
+
+def zoomed_view_pose(
+    frame: dict,
+    distance: float,
+    zoom: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Eye, look-at, and up for this frame at a zoom relative to the camera.
+
+    ``zoom`` 1 looks through the camera at ``distance``. A smaller zoom moves
+    the eye forward along the optical axis and leaves the look-at point put.
+    """
+    eye, look, up = camera_view_pose(frame, distance)
+    scale = float(zoom)
+    if not np.isfinite(scale) or scale <= 0.0:
+        scale = 1.0
+    return look + (eye - look) * scale, look, up
 
 
 def look_distance(frame: dict, point: np.ndarray, minimum: float) -> float:

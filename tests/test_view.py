@@ -19,6 +19,8 @@ from video2mesh.viewmath import (
     apply_key_effect,
     background_plane_depth,
     camera_view_pose,
+    zoom_ratio,
+    zoomed_view_pose,
     dolly_camera,
     fly_camera,
     fly_distance,
@@ -209,6 +211,19 @@ def test_undistort_leaves_a_pinhole_bitmap_unchanged():
         intrinsics={"f": 8.0, "fx": 8.0, "fy": 8.0, "cx": 5.0, "cy": 4.0, "k1": 0.0},
     )
     np.testing.assert_array_equal(undistort_bgr(image, radial), image)
+
+
+def test_frame_step_keeps_the_zoom_ratio():
+    assert zoom_ratio(5.0, 10.0) == pytest.approx(0.5)
+    assert zoom_ratio(5.0, 0.0) == pytest.approx(1.0)
+    frame = _frame()
+    full_eye, full_look, full_up = camera_view_pose(frame, distance=8.0)
+    eye, look, up = zoomed_view_pose(frame, distance=8.0, zoom=0.5)
+    np.testing.assert_allclose(look, full_look)
+    np.testing.assert_allclose(up, full_up)
+    np.testing.assert_allclose(eye, full_look + 0.5 * (full_eye - full_look))
+    same, _, _ = zoomed_view_pose(frame, distance=8.0, zoom=1.0)
+    np.testing.assert_allclose(same, full_eye)
 
 
 def test_pick_ray_rejects_the_infinite_far_plane():
