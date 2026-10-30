@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import open3d as o3d
 import pytest
 
 from video2mesh.cli import main
@@ -23,7 +24,12 @@ from video2mesh.viewmath import (
     fly_distance,
     frustum_visible,
     half_turn,
+    marker_axes,
+    marker_mesh,
     undistort_bgr,
+    world_to_camera_matrix,
+    SurfacePicker,
+    pick_ray,
     image_plane_corners,
     image_plane_mesh,
     interpret_key,
@@ -135,7 +141,7 @@ def test_image_plane_is_the_sensor_rectangle():
     assert len(mesh.triangle_uvs) == 12
     verts = np.asarray(mesh.vertices)
     np.testing.assert_allclose(verts[0], [-1.0, -1.0, 2.0])
-    # Top-left of the photo samples the top of the bitmap, not a 180 turn.
+    # Top-left of the photo samples the top of the bitmap (texture v=1).
     uvs = np.asarray(mesh.triangle_uvs)
     np.testing.assert_allclose(uvs[0], [0.0, 1.0])
     np.testing.assert_allclose(uvs[1], [1.0, 0.0])
@@ -176,6 +182,21 @@ def test_image_mode_keeps_only_the_current_frustum():
     assert not frustum_visible(2, 1, True)
 
 
+def test_pinhole_extrinsic_matches_the_upright_view():
+    frame = _frame(
+        world_to_camera=[[0, -1, 0, 1], [0, 0, -1, 2], [1, 0, 0, 3]],
+    )
+    del frame["camera_center_world"]
+    extrinsic = world_to_camera_matrix(frame)
+    # Open3D turns a world-to-camera matrix into its camera the same way.
+    model = np.linalg.inv(extrinsic) @ np.diag([1.0, -1.0, -1.0, 1.0])
+    eye, look, up = camera_view_pose(frame, distance=4.0)
+    forward = (look - eye) / np.linalg.norm(look - eye)
+    np.testing.assert_allclose(model[:3, 3], eye)
+    np.testing.assert_allclose(model[:3, 1], up)
+    np.testing.assert_allclose(-model[:3, 2], forward)
+
+
 def test_undistort_leaves_a_pinhole_bitmap_unchanged():
     image = np.zeros((8, 10, 3), dtype=np.uint8)
     image[1, 2] = (9, 8, 7)
@@ -188,6 +209,46 @@ def test_undistort_leaves_a_pinhole_bitmap_unchanged():
         intrinsics={"f": 8.0, "fx": 8.0, "fy": 8.0, "cx": 5.0, "cy": 4.0, "k1": 0.0},
     )
     np.testing.assert_array_equal(undistort_bgr(image, radial), image)
+
+
+def test_pick_ray_rejects_the_infinite_far_plane():
+    ray = pick_ray(np.array([0.0, 0.0, 5.0]), np.array([0.0, 0.2, 4.9]))
+    assert ray is not None
+    origin, direction = ray
+    np.testing.assert_allclose(origin, [0.0, 0.0, 5.0])
+    np.testing.assert_allclose(direction, [0.0, 0.2, -0.1])
+    assert pick_ray(np.array([0.0, 0.0, 5.0]), np.array([np.nan, 0.0, -np.inf])) is None
+
+
+def test_marker_sits_on_the_clicked_surface_point():
+    triangle = o3d.geometry.TriangleMesh()
+    triangle.vertices = o3d.utility.Vector3dVector([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+    triangle.triangles = o3d.utility.Vector3iVector([[0, 1, 2]])
+    picker = SurfacePicker(triangle, snap_distance=0.1)
+    hit = picker.hit(np.array([0.2, 0.2, 1.0]), np.array([0.0, 0.0, -1.0]))
+    np.testing.assert_allclose(hit, [0.2, 0.2, 0.0], atol=1e-5)
+    assert picker.hit(np.array([2.0, 2.0, 1.0]), np.array([0.0, 0.0, -1.0])) is None
+    assert picker.hit(np.array([0.2, 0.2, 1.0]), np.zeros(3)) is None
+
+    cloud = o3d.geometry.PointCloud()
+    cloud.points = o3d.utility.Vector3dVector([[0.0, 0.0, 1.0], [0.0, 0.01, 5.0], [1.0, 0.0, 1.0]])
+    points = SurfacePicker(cloud, snap_distance=0.05)
+    np.testing.assert_allclose(points.hit(np.zeros(3), np.array([0.0, 0.0, 1.0])), [0.0, 0.0, 1.0])
+    assert points.hit(np.zeros(3), np.array([0.0, 1.0, 0.0])) is None
+
+    cube = marker_mesh("cube", 2.0)
+    center = np.asarray(cube.vertices).mean(axis=0)
+    np.testing.assert_allclose(center, [0.0, 0.0, 0.0], atol=1e-6)
+    extent = np.asarray(cube.vertices).max(axis=0) - np.asarray(cube.vertices).min(axis=0)
+    np.testing.assert_allclose(extent, [2.0, 2.0, 2.0])
+    sphere = marker_axes(4.0)
+    ends = np.asarray(sphere.points)
+    np.testing.assert_allclose(ends[1], [4.0, 0.0, 0.0])
+    np.testing.assert_allclose(ends[2], [0.0, 4.0, 0.0])
+    np.testing.assert_allclose(ends[3], [0.0, 0.0, 4.0])
+    ball = marker_mesh("sphere", 2.0)
+    radius = np.linalg.norm(np.asarray(ball.vertices), axis=1)
+    np.testing.assert_allclose(radius, np.full(len(radius), 1.0), atol=1e-5)
 
 
 def test_half_turn_swaps_opposite_corners():

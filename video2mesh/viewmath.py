@@ -43,7 +43,9 @@ pinhole plane, so the mesh and the COLMAP points land on the same pixels.
 Only that camera's frustum stays visible. Feature points draws the sparse
 COLMAP points. The Mesh alpha slider changes how solid the mesh is. The view
 moves to that camera. Changing frame while the image is on looks through the
-new camera.
+new camera. Place, then click the mesh, attaches a cube or sphere to that
+point. X, Y, and Z slide it along each world axis. Place again to attach it
+somewhere else.
 
 The side panel shows the original frame from out/frames. Points are projected
 with that frame's pose and intrinsics, including lens distortion. Images in
@@ -393,13 +395,14 @@ def image_plane_mesh(frame: dict, rgb: np.ndarray, depth: float) -> o3d.geometry
     # 0..3 is CCW when looking along the optical axis. 4..7 faces the scene.
     triangles = np.array([[0, 2, 1], [0, 3, 2], [4, 5, 6], [4, 6, 7]], dtype=np.int32)
     mesh.triangles = o3d.utility.Vector3iVector(triangles)
-    # Filament treats v=0 as the bottom of the bitmap. Pixel (0, 0) is the
-    # top of the photo, so the top edge uses v=1. A 180 degree turn would
-    # also swap left and right, and the points would miss the photo.
+    # Filament samples v=0 at the bottom of the bitmap. Pixel (0, 0) is the
+    # top of the photo, so the top edge of the plane uses v=1.
     tl, tr, br, bl = (0.0, 1.0), (1.0, 1.0), (1.0, 0.0), (0.0, 0.0)
     uvs = [tl, br, tr, tl, bl, br, tl, tr, br, tl, br, bl]
     mesh.triangle_uvs = o3d.utility.Vector2dVector(np.asarray(uvs, dtype=np.float64))
     mesh.triangle_material_ids = o3d.utility.IntVector([0, 0, 0, 0])
+    # The unlit shader multiplies the texture by the vertex color.
+    mesh.paint_uniform_color([1.0, 1.0, 1.0])
     texture = np.ascontiguousarray(_fit_rgb(rgb, 1024))
     mesh.textures = [o3d.geometry.Image(texture)]
     return mesh
@@ -425,6 +428,19 @@ def pinhole_matrix(frame: dict) -> tuple[np.ndarray, float, float]:
         dtype=np.float64,
     )
     return matrix, float(width), float(height)
+
+
+def world_to_camera_matrix(frame: dict) -> np.ndarray:
+    """4x4 world-to-camera matrix for this frame.
+
+    Open3D's pinhole setup consumes this directly. It turns the matrix into
+    the same upright view as :func:`camera_view_pose`.
+    """
+    rotation, center = _camera_pose(frame)
+    matrix = np.eye(4, dtype=np.float64)
+    matrix[:3, :3] = rotation
+    matrix[:3, 3] = -rotation @ center
+    return matrix
 
 
 def camera_view_pose(
@@ -515,6 +531,104 @@ def undistort_bgr(image_bgr: np.ndarray, frame: dict) -> np.ndarray:
 def half_turn(image: np.ndarray) -> np.ndarray:
     """Rotate an image 180 degrees. Opposite corners trade places."""
     return np.ascontiguousarray(np.rot90(image, 2))
+
+
+def pick_ray(eye: np.ndarray, aim: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
+    """Ray from the camera through one finite point on the view.
+
+    The far edge of the depth buffer unprojects to infinity, so a ray built
+    from that point never meets the mesh. ``aim`` has to be a real point
+    in front of the camera.
+    """
+    eye = np.asarray(eye, dtype=np.float64).reshape(3)
+    aim = np.asarray(aim, dtype=np.float64).reshape(3)
+    direction = aim - eye
+    if not np.isfinite(direction).all() or float(np.dot(direction, direction)) < 1e-20:
+        return None
+    return eye.copy(), direction
+
+
+class SurfacePicker:
+    """First surface point along a ray. Meshes win over point clouds."""
+
+    def __init__(self, geometry: o3d.geometry.Geometry, *, snap_distance: float) -> None:
+        self.snap_distance = max(float(snap_distance), 1e-8)
+        self._scene = None
+        self._points = None
+        if isinstance(geometry, o3d.geometry.TriangleMesh) and len(geometry.triangles):
+            scene = o3d.t.geometry.RaycastingScene()
+            vertices = np.asarray(geometry.vertices, dtype=np.float32)
+            triangles = np.asarray(geometry.triangles, dtype=np.uint32)
+            scene.add_triangles(o3d.core.Tensor(vertices), o3d.core.Tensor(triangles))
+            self._scene = scene
+        elif isinstance(geometry, o3d.geometry.PointCloud) and len(geometry.points):
+            self._points = np.asarray(geometry.points, dtype=np.float64)
+
+    def hit(self, origin: np.ndarray, direction: np.ndarray) -> np.ndarray | None:
+        """World point where the ray meets the surface, or None on a miss."""
+        origin = np.asarray(origin, dtype=np.float64).reshape(3)
+        direction = np.asarray(direction, dtype=np.float64).reshape(3)
+        if float(np.dot(direction, direction)) < 1e-20:
+            return None
+        if self._scene is not None:
+            ray = np.concatenate([origin, direction]).astype(np.float32)
+            answer = self._scene.cast_rays(o3d.core.Tensor(ray.reshape(1, 6)))
+            distance = float(np.asarray(answer["t_hit"].numpy()).reshape(-1)[0])
+            if not np.isfinite(distance):
+                return None
+            return origin + direction * distance
+        if self._points is None or len(self._points) == 0:
+            return None
+        return _first_point_along_ray(self._points, origin, direction, self.snap_distance)
+
+
+def marker_mesh(kind: str, size: float) -> o3d.geometry.TriangleMesh:
+    """Cube or sphere centered on the origin, so a translation parks it on a point."""
+    size = max(float(size), 1e-6)
+    if kind == "sphere":
+        mesh = o3d.geometry.TriangleMesh.create_sphere(radius=size * 0.5, resolution=16)
+    else:
+        mesh = o3d.geometry.TriangleMesh.create_box(width=size, height=size, depth=size)
+        mesh.translate((-size * 0.5, -size * 0.5, -size * 0.5))
+    mesh.compute_vertex_normals()
+    mesh.paint_uniform_color((0.93, 0.45, 0.12))
+    return mesh
+
+
+def marker_axes(length: float) -> o3d.geometry.LineSet:
+    """X, Y, and Z lines from the origin. Red, green, and blue."""
+    length = max(float(length), 1e-6)
+    points = np.array(
+        [[0.0, 0.0, 0.0], [length, 0.0, 0.0], [0.0, length, 0.0], [0.0, 0.0, length]],
+        dtype=np.float64,
+    )
+    lines = np.array([[0, 1], [0, 2], [0, 3]], dtype=np.int32)
+    colors = np.array([[1.0, 0.2, 0.2], [0.2, 0.85, 0.2], [0.3, 0.45, 1.0]], dtype=np.float64)
+    axis = o3d.geometry.LineSet()
+    axis.points = o3d.utility.Vector3dVector(points)
+    axis.lines = o3d.utility.Vector2iVector(lines)
+    axis.colors = o3d.utility.Vector3dVector(colors)
+    return axis
+
+
+def _first_point_along_ray(
+    points: np.ndarray,
+    origin: np.ndarray,
+    direction: np.ndarray,
+    snap_distance: float,
+) -> np.ndarray | None:
+    length = float(np.linalg.norm(direction))
+    if length < 1e-12:
+        return None
+    unit = direction / length
+    offset = points - origin
+    along = offset @ unit
+    sideways = np.linalg.norm(offset - along[:, None] * unit, axis=1)
+    near = (along > 1e-6) & (sideways <= snap_distance)
+    if not np.any(near):
+        return None
+    chosen = np.flatnonzero(near)[np.argmin(along[near])]
+    return points[chosen].copy()
 
 
 def render_overlay(

@@ -34,13 +34,18 @@ from video2mesh.viewmath import (
     load_frame_bgr,
     load_overlay,
     look_distance,
+    marker_axes,
+    marker_mesh,
     orbit_camera,
+    pick_ray,
     pinhole_matrix,
+    world_to_camera_matrix,
     pose_from_model,
     roll_camera,
     project_points,
     render_overlay,
     starting_frame_index,
+    SurfacePicker,
 )
 
 
@@ -203,6 +208,11 @@ class _ReconstructionWindow:
         self._checkbox_guard = False
         self.show_features = False
         self.mesh_alpha = 0.35
+        self._placing = False
+        self._eat_mouse = False
+        self._axis_guard = False
+        self._position: np.ndarray | None = None
+        self._marker_kind_shown = ""
 
     def run(self) -> None:
         import open3d.visualization.gui as gui
@@ -236,6 +246,20 @@ class _ReconstructionWindow:
         self.alpha_slider.set_limits(0.0, 1.0)
         self.alpha_slider.double_value = self.mesh_alpha
         self.alpha_slider.set_on_value_changed(self._on_mesh_alpha)
+        self.shape = gui.Combobox()
+        self.shape.add_item("Cube")
+        self.shape.add_item("Sphere")
+        self.shape.selected_index = 0
+        self.shape.tooltip = "Shape to attach to the mesh"
+        self.shape.set_on_selection_changed(self._on_shape)
+        self.place = gui.Button("Place")
+        self.place.tooltip = "Click Place, then a point on the mesh. Place again to attach somewhere else."
+        self.place.set_on_clicked(self._on_place)
+        self.marker_label = gui.Label("Place, then click the mesh")
+        self.marker_label.text_color = gui.Color(1, 1, 1)
+        self.x_label, self.x_edit = self._axis_field("X", gui.Color(1.0, 0.35, 0.35), self._on_axis_x)
+        self.y_label, self.y_edit = self._axis_field("Y", gui.Color(0.35, 0.9, 0.35), self._on_axis_y)
+        self.z_label, self.z_edit = self._axis_field("Z", gui.Color(0.45, 0.55, 1.0), self._on_axis_z)
         self.image = gui.ImageWidget()
         self._lit = rendering.MaterialRecord()
         self._lit.shader = "defaultLit"
@@ -262,6 +286,9 @@ class _ReconstructionWindow:
         self._feature_mat.shader = "defaultUnlit"
         self._feature_mat.point_size = 5.0
         self._feature_mat.base_color = [1.0, 1.0, 1.0, 1.0]
+        self._marker_mat = rendering.MaterialRecord()
+        self._marker_mat.shader = "defaultLit"
+        self._marker_mat.base_color = [0.93, 0.45, 0.12, 1.0]
         model = self.geometries[0]
         material = self._points if isinstance(model, o3d.geometry.PointCloud) else self._lit
         self.scene.scene.add_geometry("model", model, material)
@@ -279,11 +306,32 @@ class _ReconstructionWindow:
         self._reset_bounds = box
         self._reset_center = center.astype(np.float32)
         self.scene.setup_camera(60.0, box, self._reset_center)
+        extent = float(np.linalg.norm(np.asarray(box.get_extent(), dtype=np.float64)))
+        self._marker_size = max(extent * 0.03, self.scale * 0.35, 1e-3)
+        self._picker = SurfacePicker(
+            model,
+            snap_distance=max(self._marker_size * 1.5, extent * 0.02, 1e-4),
+        )
+        low = np.asarray(box.get_min_bound(), dtype=np.float64)
+        high = np.asarray(box.get_max_bound(), dtype=np.float64)
+        pad = max(extent, 1.0)
+        for edit in (self.x_edit, self.y_edit, self.z_edit):
+            edit.set_limits(float(low.min() - pad), float(high.max() + pad))
+        self.scene.set_on_mouse(self._on_mouse)
         self.window.add_child(self.scene)
         self.window.add_child(self.show_image)
         self.window.add_child(self.features)
         self.window.add_child(self.alpha_label)
         self.window.add_child(self.alpha_slider)
+        self.window.add_child(self.shape)
+        self.window.add_child(self.place)
+        self.window.add_child(self.marker_label)
+        self.window.add_child(self.x_label)
+        self.window.add_child(self.x_edit)
+        self.window.add_child(self.y_label)
+        self.window.add_child(self.y_edit)
+        self.window.add_child(self.z_label)
+        self.window.add_child(self.z_edit)
         self.window.add_child(self.label)
         self.window.add_child(self.image)
         self.window.set_on_layout(self._on_layout)
@@ -299,17 +347,175 @@ class _ReconstructionWindow:
         check_h = em + 12
         label_h = max(64, em * 3)
         x = rect.get_right() - panel
+        inner_w = max(1, panel - 16)
+        left = x + 8
         self.scene.frame = gui.Rect(rect.x, rect.y, max(1, rect.width - panel), rect.height)
-        controls = (self.show_image, self.features, self.alpha_label, self.alpha_slider)
-        for row, widget in enumerate(controls):
-            widget.frame = gui.Rect(x + 8, rect.y + 4 + row * check_h, max(1, panel - 16), check_h)
-        text_top = 4 + len(controls) * check_h
-        self.label.frame = gui.Rect(x + 8, rect.y + text_top, max(1, panel - 16), label_h)
+        rows = (
+            ((self.show_image,), "full"),
+            ((self.features,), "full"),
+            ((self.alpha_label,), "full"),
+            ((self.alpha_slider,), "full"),
+            ((self.shape, self.place), "split"),
+            ((self.marker_label,), "full"),
+            ((self.x_label, self.x_edit), "axis"),
+            ((self.y_label, self.y_edit), "axis"),
+            ((self.z_label, self.z_edit), "axis"),
+        )
+        top = rect.y + 4
+        for widgets, kind in rows:
+            self._place_row(widgets, kind, left, top, inner_w, check_h, em)
+            top += check_h
+        text_top = top - rect.y
+        self.label.frame = gui.Rect(left, rect.y + text_top, inner_w, label_h)
         image_top = text_top + label_h
         self.image.frame = gui.Rect(x, rect.y + image_top, panel, max(1, rect.height - image_top))
         if abs(panel - self._panel_width) > 8:
             self._panel_width = panel
             self._refresh_overlay()
+
+    def _place_row(self, widgets, kind: str, left: int, top: int, inner_w: int, height: int, em: int) -> None:
+        gui = self._gui
+        if kind == "split":
+            gap = 8
+            half = max(1, (inner_w - gap) // 2)
+            widgets[0].frame = gui.Rect(left, top, half, height)
+            widgets[1].frame = gui.Rect(left + half + gap, top, max(1, inner_w - half - gap), height)
+            return
+        if kind == "axis":
+            label_w = max(28, em * 2)
+            widgets[0].frame = gui.Rect(left, top, label_w, height)
+            widgets[1].frame = gui.Rect(left + label_w, top, max(1, inner_w - label_w), height)
+            return
+        widgets[0].frame = gui.Rect(left, top, inner_w, height)
+
+    def _axis_field(self, caption: str, color, callback):
+        label = self._gui.Label(caption)
+        label.text_color = color
+        edit = self._gui.NumberEdit(self._gui.NumberEdit.DOUBLE)
+        edit.decimal_precision = 4
+        edit.double_value = 0.0
+        edit.enabled = False
+        edit.tooltip = f"Slide the shape along {caption}"
+        edit.set_on_value_changed(callback)
+        return label, edit
+
+    def _on_mouse(self, event):
+        gui = self._gui
+        if self._eat_mouse:
+            if event.type == gui.MouseEvent.Type.BUTTON_UP:
+                self._eat_mouse = False
+            return gui.Widget.EventCallbackResult.HANDLED
+        if not self._placing:
+            return gui.Widget.EventCallbackResult.IGNORED
+        if event.type != gui.MouseEvent.Type.BUTTON_DOWN or not event.is_button_down(gui.MouseButton.LEFT):
+            return gui.Widget.EventCallbackResult.IGNORED
+        hit = self._pick_surface(event.x, event.y)
+        if hit is None:
+            self.marker_label.text = "No mesh there. Click the surface."
+            return gui.Widget.EventCallbackResult.IGNORED
+        self._eat_mouse = True
+        self._placing = False
+        self.place.text = "Place"
+        self._set_position(hit)
+        self.marker_label.text = "Attached. Edit X, Y, or Z to slide it."
+        self.window.post_redraw()
+        return gui.Widget.EventCallbackResult.HANDLED
+
+    def _pick_surface(self, x: float, y: float) -> np.ndarray | None:
+        frame = self.scene.frame
+        width = float(frame.width)
+        height = float(frame.height)
+        if width < 1.0 or height < 1.0:
+            return None
+        px, py = float(x), float(y)
+        if not (0.0 <= px < width and 0.0 <= py < height):
+            px -= float(frame.x)
+            py -= float(frame.y)
+        if not (0.0 <= px < width and 0.0 <= py < height):
+            return None
+        camera = self.scene.scene.camera
+        eye, _forward, _up = pose_from_model(camera.get_model_matrix())
+        # Depth 1 is the far plane, which unprojects to infinity and misses.
+        aim = np.asarray(camera.unproject(px, py, 0.0, width, height), dtype=np.float64).reshape(3)
+        ray = pick_ray(eye, aim)
+        if ray is None:
+            return None
+        origin, direction = ray
+        return self._picker.hit(origin, direction)
+
+    def _on_place(self) -> None:
+        self._placing = not self._placing
+        if self._placing:
+            self.place.text = "Click mesh"
+            self.marker_label.text = "Click a point on the mesh"
+        else:
+            self.place.text = "Place"
+            self.marker_label.text = (
+                "Place, then click the mesh" if self._position is None else "Attached. Edit X, Y, or Z to slide it."
+            )
+
+    def _on_shape(self, _text: str, _index: int) -> None:
+        if self._position is None:
+            return
+        self._rebuild_marker()
+        self.window.post_redraw()
+
+    def _on_axis_x(self, value: float) -> None:
+        self._on_axis(0, value)
+
+    def _on_axis_y(self, value: float) -> None:
+        self._on_axis(1, value)
+
+    def _on_axis_z(self, value: float) -> None:
+        self._on_axis(2, value)
+
+    def _on_axis(self, index: int, value: float) -> None:
+        if self._axis_guard or self._position is None:
+            return
+        self._position[index] = float(value)
+        self._apply_marker_transform()
+        self.window.post_redraw()
+
+    def _set_position(self, position: np.ndarray) -> None:
+        self._position = np.asarray(position, dtype=np.float64).reshape(3).copy()
+        self._axis_guard = True
+        try:
+            self.x_edit.double_value = float(self._position[0])
+            self.y_edit.double_value = float(self._position[1])
+            self.z_edit.double_value = float(self._position[2])
+        finally:
+            self._axis_guard = False
+        for edit in (self.x_edit, self.y_edit, self.z_edit):
+            edit.enabled = True
+        self._ensure_marker()
+        self._apply_marker_transform()
+
+    def _ensure_marker(self) -> None:
+        kind = "sphere" if self.shape.selected_text == "Sphere" else "cube"
+        if self.scene.scene.has_geometry("marker") and kind == self._marker_kind_shown:
+            return
+        self._rebuild_marker()
+
+    def _rebuild_marker(self) -> None:
+        scene = self.scene.scene
+        for name in ("marker", "marker-axes"):
+            if scene.has_geometry(name):
+                scene.remove_geometry(name)
+        kind = "sphere" if self.shape.selected_text == "Sphere" else "cube"
+        self._marker_kind_shown = kind
+        scene.add_geometry("marker", marker_mesh(kind, self._marker_size), self._marker_mat)
+        scene.add_geometry("marker-axes", marker_axes(self._marker_size * 2.5), self._lines)
+        self._apply_marker_transform()
+
+    def _apply_marker_transform(self) -> None:
+        if self._position is None:
+            return
+        matrix = np.eye(4, dtype=np.float64)
+        matrix[:3, 3] = self._position
+        scene = self.scene.scene
+        for name in ("marker", "marker-axes"):
+            if scene.has_geometry(name):
+                scene.set_geometry_transform(name, matrix)
 
     def _on_key(self, event) -> bool:
         if event.type != self._gui.KeyEvent.Type.DOWN:
@@ -411,17 +617,23 @@ class _ReconstructionWindow:
         minimum = max(extent * 0.35, self.scale * 4.0, 1e-2)
         target = np.asarray(self._reset_center, dtype=np.float64)
         distance = look_distance(frame, target, minimum)
-        eye, look, up = camera_view_pose(frame, distance)
-        look32 = look.astype(np.float32)
-        self.scene.look_at(look32, eye.astype(np.float32), up.astype(np.float32))
-        # look_at leaves the orbit pivot where it was.
-        self.scene.center_of_rotation = look32
+        _eye, look, _up = camera_view_pose(frame, distance)
         near = min(max(self.scale * 0.02, 1e-4), self.scale * 0.25)
         plane = self._photo_depth(frame)
         far = max(extent * 20.0, distance * 8.0, plane * 3.0, self.scale * 20.0, near * 1000.0)
         matrix, width, height = pinhole_matrix(frame)
-        # Intrinsics map the image rectangle onto the view, principal point included.
+        # setup_camera keeps this pinhole camera across resizes. look_at would
+        # replace it with a generic field of view, and the points would miss
+        # the photo. The extrinsic is the COLMAP world-to-camera matrix.
+        self.scene.setup_camera(
+            matrix,
+            world_to_camera_matrix(frame),
+            int(width),
+            int(height),
+            self._reset_bounds,
+        )
         self.scene.scene.camera.set_projection(matrix, near, far, width, height)
+        self.scene.center_of_rotation = look.astype(np.float32)
 
     def _pose(self):
         eye, _forward, up = pose_from_model(self.scene.scene.camera.get_model_matrix())
