@@ -42,8 +42,8 @@ so the picture shows through. The photo is undistorted onto that camera's
 pinhole plane, so the mesh and the COLMAP points land on the same pixels.
 Only that camera's frustum stays visible. Feature points draws the sparse
 COLMAP points. The Mesh alpha slider changes how solid the mesh is. The view
-moves to that camera. Changing frame while the image is on looks through the
-new camera and keeps the current zoom. Place, then click the mesh, attaches a cube or sphere to that
+moves to that camera. Changing frame looks through the new camera and keeps
+any zoom, pan, or orbit until Reset or R. Place, then click the mesh, attaches a cube or sphere to that
 point. X, Y, and Z slide it along each world axis. Place again to attach it
 somewhere else.
 
@@ -460,33 +460,77 @@ def camera_view_pose(
     return center.copy(), center + forward * ahead, up
 
 
-def zoom_ratio(current_distance: float, reference_distance: float) -> float:
-    """How far the eye sits relative to the last frame view. 1 is the default.
+def _camera_axes(frame: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    rotation, center = _camera_pose(frame)
+    right = rotation.T @ np.array([1.0, 0.0, 0.0])
+    up = rotation.T @ np.array([0.0, -1.0, 0.0])
+    forward = rotation.T @ np.array([0.0, 0.0, 1.0])
+    return right, up, forward, center
 
-    A smaller ratio is zoomed in. A missing or unusable reference stays at 1.
+
+def follow_offset(
+    frame: dict,
+    eye: np.ndarray,
+    look: np.ndarray,
+    up: np.ndarray,
+    distance: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """How the current view differs from looking straight through ``frame``.
+
+    The eye and look-at offsets are fractions of ``distance``, so the same
+    zoom and pan fit the next frame. The up vector is in that camera's axes.
     """
-    current = float(current_distance)
-    reference = float(reference_distance)
-    if reference <= 1e-8 or not np.isfinite(current) or current <= 1e-8:
-        return 1.0
-    return current / reference
+    right, cam_up, forward, center = _camera_axes(frame)
+    basis = np.column_stack([right, cam_up, forward])
+    scale = max(float(distance), 1e-6)
+    eye_local = basis.T @ (np.asarray(eye, dtype=np.float64).reshape(3) - center)
+    look_local = basis.T @ (np.asarray(look, dtype=np.float64).reshape(3) - center)
+    up_local = basis.T @ np.asarray(up, dtype=np.float64).reshape(3)
+    up_norm = float(np.linalg.norm(up_local))
+    if up_norm < 1e-8:
+        up_local = np.array([0.0, 1.0, 0.0])
+    else:
+        up_local = up_local / up_norm
+    return eye_local / scale, (look_local - np.array([0.0, 0.0, scale])) / scale, up_local
 
 
-def zoomed_view_pose(
+def follow_offset_is_plain(offset: tuple[np.ndarray, np.ndarray, np.ndarray]) -> bool:
+    """True when the view is the unmodified camera, within a small tolerance."""
+    eye_user, look_user, up_local = offset
+    return (
+        float(np.linalg.norm(eye_user)) < 1e-3
+        and float(np.linalg.norm(look_user)) < 1e-3
+        and float(np.linalg.norm(up_local - np.array([0.0, 1.0, 0.0]))) < 1e-3
+    )
+
+
+def apply_follow_offset(
     frame: dict,
     distance: float,
-    zoom: float,
+    offset: tuple[np.ndarray, np.ndarray, np.ndarray],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Eye, look-at, and up for this frame at a zoom relative to the camera.
-
-    ``zoom`` 1 looks through the camera at ``distance``. A smaller zoom moves
-    the eye forward along the optical axis and leaves the look-at point put.
-    """
-    eye, look, up = camera_view_pose(frame, distance)
-    scale = float(zoom)
-    if not np.isfinite(scale) or scale <= 0.0:
-        scale = 1.0
-    return look + (eye - look) * scale, look, up
+    """Place a saved zoom, pan, or orbit on this frame's camera."""
+    eye_user, look_user, up_local = offset
+    right, cam_up, forward, center = _camera_axes(frame)
+    basis = np.column_stack([right, cam_up, forward])
+    scale = max(float(distance), 1e-6)
+    eye = center + basis @ (np.asarray(eye_user, dtype=np.float64).reshape(3) * scale)
+    look = center + basis @ (
+        np.array([0.0, 0.0, scale]) + np.asarray(look_user, dtype=np.float64).reshape(3) * scale
+    )
+    up = basis @ np.asarray(up_local, dtype=np.float64).reshape(3)
+    view = look - eye
+    view_norm = float(np.linalg.norm(view))
+    if view_norm < 1e-8:
+        return camera_view_pose(frame, distance)
+    view = view / view_norm
+    up = up - view * float(np.dot(up, view))
+    up_norm = float(np.linalg.norm(up))
+    if up_norm < 1e-6:
+        up = cam_up
+    else:
+        up = up / up_norm
+    return eye, look, up
 
 
 def look_distance(frame: dict, point: np.ndarray, minimum: float) -> float:

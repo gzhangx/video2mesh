@@ -115,8 +115,8 @@ The same key list is printed in the terminal when the window opens:
 | Z / C | Roll clockwise / counter-clockwise around the view direction. Same step as pitch and yaw; a held key repeats. |
 | Q / E | Zoom in / out. The eye moves and the look-at point stays. |
 | Up / Down | Dolly forward / backward along the view. The eye and the look-at point move together, by a step proportional to the scene size. |
-| R | Reset the view. |
-| Left / Right, N / P, [ / ] | Previous / next registered frame. With the image on, the view follows that camera and keeps the current zoom. |
+| R, or Reset | Drop zoom, pan, and orbit. With the image on, look straight through this frame. Otherwise restore the starting camera. |
+| Left / Right, N / P, [ / ] | Previous / next frame. With the image on, follow that camera and keep the current zoom or orbit until Reset. |
 | F, or Show image | Draw that frame's photo, undistorted, on its camera plane and look through the camera. The mesh turns transparent, and only that camera stays visible. |
 | H | Hide or show the projected points. |
 | V | Color points by their RGB or by depth. |

@@ -18,9 +18,10 @@ from video2mesh.viewmath import (
     ViewState,
     apply_key_effect,
     background_plane_depth,
+    apply_follow_offset,
     camera_view_pose,
-    zoom_ratio,
-    zoomed_view_pose,
+    follow_offset,
+    follow_offset_is_plain,
     dolly_camera,
     fly_camera,
     fly_distance,
@@ -213,17 +214,20 @@ def test_undistort_leaves_a_pinhole_bitmap_unchanged():
     np.testing.assert_array_equal(undistort_bgr(image, radial), image)
 
 
-def test_frame_step_keeps_the_zoom_ratio():
-    assert zoom_ratio(5.0, 10.0) == pytest.approx(0.5)
-    assert zoom_ratio(5.0, 0.0) == pytest.approx(1.0)
-    frame = _frame()
-    full_eye, full_look, full_up = camera_view_pose(frame, distance=8.0)
-    eye, look, up = zoomed_view_pose(frame, distance=8.0, zoom=0.5)
-    np.testing.assert_allclose(look, full_look)
-    np.testing.assert_allclose(up, full_up)
-    np.testing.assert_allclose(eye, full_look + 0.5 * (full_eye - full_look))
-    same, _, _ = zoomed_view_pose(frame, distance=8.0, zoom=1.0)
-    np.testing.assert_allclose(same, full_eye)
+def test_follow_offset_carries_zoom_onto_the_next_camera():
+    home = _frame()
+    distance = 10.0
+    eye, look, up = camera_view_pose(home, distance)
+    assert follow_offset_is_plain(follow_offset(home, eye, look, up, distance))
+    zoomed_eye = look + 0.4 * (eye - look)
+    offset = follow_offset(home, zoomed_eye, look, up, distance)
+    assert not follow_offset_is_plain(offset)
+    moved = _frame(camera_center_world=[4.0, 1.0, 0.0])
+    got_eye, got_look, got_up = apply_follow_offset(moved, 20.0, offset)
+    straight_eye, straight_look, straight_up = camera_view_pose(moved, 20.0)
+    np.testing.assert_allclose(got_look, straight_look)
+    np.testing.assert_allclose(got_up, straight_up)
+    np.testing.assert_allclose(got_eye, straight_look + 0.4 * (straight_eye - straight_look))
 
 
 def test_pick_ray_rejects_the_infinite_far_plane():
